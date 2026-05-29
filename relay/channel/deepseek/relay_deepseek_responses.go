@@ -110,25 +110,27 @@ func DeepSeekResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo,
 			return nil
 		}
 		createdEvent := map[string]any{
-			"id":      responseID,
-			"object":  "response",
-			"model":   model,
-			"status":  "in_progress",
+			"id":         responseID,
+			"object":     "response",
+			"model":      model,
+			"status":     "in_progress",
 			"created_at": createdAt,
-			"output":  []map[string]any{},
+			"output":     []map[string]any{},
 		}
-		createdJSON, _ := common.Marshal(createdEvent)
+		wrapped := map[string]any{"response": createdEvent}
+		createdJSON, _ := common.Marshal(wrapped)
 		if err := sendResponsesSSE("response.created", string(createdJSON)); err != nil {
 			return err
 		}
 		sentCreated = true
 
 		inProgressEvent := map[string]any{
-			"id": responseID,
+			"id":     responseID,
 			"object": "response",
 			"status": "in_progress",
 		}
-		inProgJSON, _ := common.Marshal(inProgressEvent)
+		inProgWrapped := map[string]any{"response": inProgressEvent}
+		inProgJSON, _ := common.Marshal(inProgWrapped)
 		_ = sendResponsesSSE("response.in_progress", string(inProgJSON))
 		return nil
 	}
@@ -143,13 +145,14 @@ func DeepSeekResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo,
 
 		itemID := "resp_item_" + responseID
 		itemEvent := map[string]any{
-			"id":      itemID,
-			"type":    "message",
-			"role":    "assistant",
-			"status":  "in_progress",
+			"id":     itemID,
+			"type":   "message",
+			"role":   "assistant",
+			"status": "in_progress",
 		}
 		itemJSON, _ := common.Marshal(itemEvent)
-		if err := sendResponsesSSE("response.output_item.added", string(itemJSON)); err != nil {
+		wrappedItem := fmt.Sprintf(`{"output_index":0,"item":%s}`, string(itemJSON))
+		if err := sendResponsesSSE("response.output_item.added", wrappedItem); err != nil {
 			return err
 		}
 		sentItemAdded = true
@@ -230,18 +233,19 @@ func DeepSeekResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo,
 						callID = fmt.Sprintf("call_%s_%d", responseID, idx)
 						toolCallIDByIndex[idx] = callID
 					}
-					toolItem := map[string]any{
-						"id":      fmt.Sprintf("resp_tool_item_%s_%d", responseID, idx),
-						"type":    "function_call",
-						"status":  "in_progress",
-						"call_id": callID,
-					}
-					if name := toolCallNameByIndex[idx]; name != "" && !toolCallNameSent[idx] {
-						toolItem["name"] = name
-						toolCallNameSent[idx] = true
-					}
-					toolItemJSON, _ := common.Marshal(toolItem)
-					if err := sendResponsesSSE("response.output_item.added", string(toolItemJSON)); err != nil {
+				toolItem := map[string]any{
+					"id":      fmt.Sprintf("resp_tool_item_%s_%d", responseID, idx),
+					"type":    "function_call",
+					"status":  "in_progress",
+					"call_id": callID,
+				}
+				if name := toolCallNameByIndex[idx]; name != "" && !toolCallNameSent[idx] {
+					toolItem["name"] = name
+					toolCallNameSent[idx] = true
+				}
+				toolItemJSON, _ := common.Marshal(toolItem)
+				wrappedToolItem := fmt.Sprintf(`{"output_index":%d,"item":%s}`, idx, string(toolItemJSON))
+				if err := sendResponsesSSE("response.output_item.added", wrappedToolItem); err != nil {
 						streamErr = types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
 						sr.Stop(streamErr)
 						return
@@ -344,7 +348,8 @@ func DeepSeekResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo,
 			"arguments": args,
 		}
 		itemDoneJSON, _ := common.Marshal(itemDone)
-		sendResponsesSSE("response.output_item.done", string(itemDoneJSON))
+		wrappedDone := fmt.Sprintf(`{"output_index":%d,"item":%s}`, idx, string(itemDoneJSON))
+		sendResponsesSSE("response.output_item.done", wrappedDone)
 	}
 
 		// Send output_item.done for text message (fires even when tool calls present)
@@ -358,8 +363,9 @@ func DeepSeekResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo,
 					{"type": "output_text", "text": responseText.String()},
 				},
 			}
-			itemDoneJSON, _ := common.Marshal(outputItem)
-			sendResponsesSSE("response.output_item.done", string(itemDoneJSON))
+			outputItemJSON, _ := common.Marshal(outputItem)
+			wrappedOutputDone := fmt.Sprintf(`{"output_index":0,"item":%s}`, string(outputItemJSON))
+			sendResponsesSSE("response.output_item.done", wrappedOutputDone)
 		}
 
 	if hasSentReasoning {
@@ -367,17 +373,18 @@ func DeepSeekResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo,
 			fmt.Sprintf(`{"item_id":"%s","summary_index":0,"text":"%s"}`, itemID, jsonEscape(reasoning)))
 	}
 
-			// Send response.completed
-			completedEvent := map[string]any{
-				"id":         responseID,
-				"object":     "response",
-				"model":      model,
-				"status":     "completed",
-				"created_at": createdAt,
-				"usage":      usage,
-			}
-			completedJSON, _ := common.Marshal(completedEvent)
-			if err := sendResponsesSSE("response.completed", string(completedJSON)); err != nil {
+		// Send response.completed
+		completedEvent := map[string]any{
+			"id":         responseID,
+			"object":     "response",
+			"model":      model,
+			"status":     "completed",
+			"created_at": createdAt,
+			"usage":      usage,
+		}
+		wrappedCompleted := map[string]any{"response": completedEvent}
+		completedJSON, _ := common.Marshal(wrappedCompleted)
+		if err := sendResponsesSSE("response.completed", string(completedJSON)); err != nil {
 				streamErr = types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
 				sr.Stop(streamErr)
 				return
