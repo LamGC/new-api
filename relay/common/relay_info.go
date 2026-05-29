@@ -60,6 +60,17 @@ type ResponsesUsageInfo struct {
 	BuiltInTools map[string]*BuildInToolInfo
 }
 
+type ResponsesConversationInfo struct {
+	// FullMessages holds the complete input message history to be persisted after response.
+	FullMessages []dto.Message
+	// PreviousResponseID from the request, preserved for storage chaining.
+	PreviousResponseID string
+	// NewResponseID is generated before DoResponse so it can be included in the SSE stream.
+	NewResponseID string
+	// Written by response handlers: the assistant messages to append to FullMessages.
+	AssistantMessages []dto.Message
+}
+
 type ChannelMeta struct {
 	ChannelType          int
 	ChannelId            int
@@ -184,6 +195,7 @@ type RelayInfo struct {
 	*ClaudeConvertInfo
 	*RerankerInfo
 	*ResponsesUsageInfo
+	*ResponsesConversationInfo
 	*ChannelMeta
 	*TaskRelayInfo
 }

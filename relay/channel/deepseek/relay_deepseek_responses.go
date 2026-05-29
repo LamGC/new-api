@@ -40,7 +40,7 @@ func DeepSeekResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp 
 		return nil, types.WithOpenAIError(*oaiErr, resp.StatusCode)
 	}
 
-	responseID := "resp_" + common.GetTimeString() + common.GetRandomString(8)
+	responseID := resolveResponseID(info)
 	responsesResp := buildResponsesResponseFromChat(&chatResp, responseID, info.UpstreamModelName)
 
 	responseBody, err := common.Marshal(responsesResp)
@@ -53,6 +53,13 @@ func DeepSeekResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp 
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
 	}
 
+	// Store assistant messages for conversation persistence
+	if convInfo := info.ResponsesConversationInfo; convInfo != nil {
+		for _, choice := range chatResp.Choices {
+			convInfo.AssistantMessages = append(convInfo.AssistantMessages, choice.Message)
+		}
+	}
+
 	return &chatResp.Usage, nil
 }
 
@@ -63,7 +70,7 @@ func DeepSeekResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo,
 	}
 	defer service.CloseResponseBodyGracefully(resp)
 
-	responseID := "resp_" + common.GetTimeString() + common.GetRandomString(8)
+	responseID := resolveResponseID(info)
 	model := info.UpstreamModelName
 	createdAt := time.Now().Unix()
 
@@ -377,6 +384,33 @@ func DeepSeekResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo,
 		usage = service.ResponseText2Usage(c, responseText.String(), info.UpstreamModelName, info.GetEstimatePromptTokens())
 	}
 
+	// Store assistant messages for conversation persistence
+	if convInfo := info.ResponsesConversationInfo; convInfo != nil {
+		assistantMsg := dto.Message{Role: "assistant"}
+		if responseText.Len() > 0 {
+			assistantMsg.SetStringContent(responseText.String())
+		}
+		// Collect tool calls if any
+		var toolCalls []dto.ToolCallRequest
+		for idx := range sentToolItems {
+			callID := toolCallIDByIndex[idx]
+			name := toolCallNameByIndex[idx]
+			args := toolCallArgsByIndex[idx]
+			toolCalls = append(toolCalls, dto.ToolCallRequest{
+				ID:   callID,
+				Type: "function",
+				Function: dto.FunctionRequest{
+					Name:      name,
+					Arguments: args,
+				},
+			})
+		}
+		if len(toolCalls) > 0 {
+			assistantMsg.SetToolCalls(toolCalls)
+		}
+		convInfo.AssistantMessages = append(convInfo.AssistantMessages, assistantMsg)
+	}
+
 	return usage, nil
 }
 
@@ -458,4 +492,11 @@ func buildResponsesResponseFromChat(chatResp *dto.OpenAITextResponse, responseID
 func jsonEscape(s string) string {
 	b, _ := json.Marshal(s)
 	return string(b[1 : len(b)-1])
+}
+
+func resolveResponseID(info *relaycommon.RelayInfo) string {
+	if info.ResponsesConversationInfo != nil && info.ResponsesConversationInfo.NewResponseID != "" {
+		return info.ResponsesConversationInfo.NewResponseID
+	}
+	return "resp_" + common.GetTimeString() + common.GetRandomString(8)
 }

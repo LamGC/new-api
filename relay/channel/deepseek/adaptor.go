@@ -9,6 +9,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relay/channel/claude"
 	"github.com/QuantumNous/new-api/relay/channel/openai"
@@ -174,13 +175,26 @@ func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommo
 		info.ReasoningEffort = request.Reasoning.Effort
 	}
 
-	// Convert Responses → Chat format for DeepSeek upstream
+	// Load previous conversation if previous_response_id is set
+	var historyMessages []dto.Message
+	if request.PreviousResponseID != "" && info != nil {
+		prevConv, exists, _ := model.GetConversationByResponseID(info.UserId, request.PreviousResponseID)
+		if exists {
+			historyMessages, _ = prevConv.GetMessages()
+		}
+	}
+
+	// Convert new input to Chat messages
 	chatReq, err := openaicompat.ResponsesRequestToChatRequest(&request)
 	if err != nil {
 		return nil, fmt.Errorf("convert responses to chat: %w", err)
 	}
 
-	// Apply DeepSeek V4 thinking suffix handling (same as ConvertOpenAIRequest)
+	// Merge history on top (history first, then new messages)
+	fullMessages := append(historyMessages, chatReq.Messages...)
+	chatReq.Messages = fullMessages
+
+	// Apply DeepSeek V4 thinking suffix handling
 	if err := applyDeepSeekV4OpenAIThinkingSuffix(info, chatReq); err != nil {
 		return nil, err
 	}
@@ -189,6 +203,13 @@ func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommo
 	if info != nil {
 		info.AppendRequestConversion(types.RelayFormatOpenAI)
 		info.FinalRequestRelayFormat = types.RelayFormatOpenAI
+
+		// Store full messages for post-response conversation storage
+		info.ResponsesConversationInfo = &relaycommon.ResponsesConversationInfo{
+			FullMessages:       fullMessages,
+			PreviousResponseID: request.PreviousResponseID,
+			NewResponseID:      "resp_" + common.GetTimeString() + common.GetRandomString(8),
+		}
 	}
 
 	return chatReq, nil
@@ -201,10 +222,21 @@ func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, request
 func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (usage any, err *types.NewAPIError) {
 	// For Responses mode, convert Chat response back to Responses format
 	if info.RelayMode == relayconstant.RelayModeResponses {
+		var u *dto.Usage
+		var e *types.NewAPIError
+
 		if info.IsStream {
-			return DeepSeekResponsesStreamHandler(c, info, resp)
+			u, e = DeepSeekResponsesStreamHandler(c, info, resp)
+		} else {
+			u, e = DeepSeekResponsesHandler(c, info, resp)
 		}
-		return DeepSeekResponsesHandler(c, info, resp)
+
+		// Save conversation after response
+		if e == nil && info.ResponsesConversationInfo != nil {
+			saveConversationFromResponse(info, u)
+		}
+
+		return u, e
 	}
 
 	switch info.RelayFormat {
@@ -214,6 +246,30 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 	default:
 		adaptor := openai.Adaptor{}
 		return adaptor.DoResponse(c, resp, info)
+	}
+}
+
+func saveConversationFromResponse(info *relaycommon.RelayInfo, usage *dto.Usage) {
+	convInfo := info.ResponsesConversationInfo
+	if convInfo == nil {
+		return
+	}
+
+	allMessages := append(convInfo.FullMessages, convInfo.AssistantMessages...)
+
+	conv := &model.ConversationResponse{
+		ResponseID:         convInfo.NewResponseID,
+		UserID:             info.UserId,
+		PreviousResponseID: convInfo.PreviousResponseID,
+		Model:              info.OriginModelName,
+	}
+	if err := conv.SetMessages(allMessages); err != nil {
+		common.SysLog("failed to set conversation messages: " + err.Error())
+		return
+	}
+
+	if err := conv.Insert(); err != nil {
+		common.SysLog("failed to save conversation: " + err.Error())
 	}
 }
 
