@@ -60,6 +60,17 @@ type ResponsesUsageInfo struct {
 	BuiltInTools map[string]*BuildInToolInfo
 }
 
+type ResponseToolMapping struct {
+	// UpstreamName is the sanitized function name sent to the Chat upstream.
+	UpstreamName string
+	// SourceType indicates the original tool type: "function" or "custom_namespace".
+	SourceType string
+	// OriginalName is the tool name as received in the Responses request.
+	OriginalName string
+	// Namespace is the custom namespace name (only for custom_namespace tools).
+	Namespace string
+}
+
 type ResponsesConversationInfo struct {
 	// FullMessages holds the complete input message history to be persisted after response.
 	FullMessages []dto.Message
@@ -69,6 +80,9 @@ type ResponsesConversationInfo struct {
 	NewResponseID string
 	// Written by response handlers: the assistant messages to append to FullMessages.
 	AssistantMessages []dto.Message
+	// ToolMapping maps upstream sanitized function names to original Responses tool info.
+	// Built during request conversion, used during response conversion to restore semantics.
+	ToolMapping map[string]ResponseToolMapping
 }
 
 type ChannelMeta struct {

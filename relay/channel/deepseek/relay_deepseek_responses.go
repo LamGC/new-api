@@ -41,7 +41,8 @@ func DeepSeekResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp 
 	}
 
 	responseID := resolveResponseID(info)
-	responsesResp := buildResponsesResponseFromChat(&chatResp, responseID, info.UpstreamModelName)
+	toolMapping := resolveToolMapping(info)
+	responsesResp := buildResponsesResponseFromChat(&chatResp, responseID, info.UpstreamModelName, toolMapping)
 
 	responseBody, err := common.Marshal(responsesResp)
 	if err != nil {
@@ -71,6 +72,7 @@ func DeepSeekResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo,
 	defer service.CloseResponseBodyGracefully(resp)
 
 	responseID := resolveResponseID(info)
+	toolMapping := resolveToolMapping(info)
 	model := info.UpstreamModelName
 	createdAt := time.Now().Unix()
 
@@ -313,25 +315,28 @@ func DeepSeekResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo,
 						itemID, jsonEscape(responseText.String())))
 			}
 
-			// Send done events for tool call items
-			for idx := range sentToolItems {
-				toolItemID := fmt.Sprintf("resp_tool_item_%s_%d", responseID, idx)
-				args := toolCallArgsByIndex[idx]
-				callID := toolCallIDByIndex[idx]
-				name := toolCallNameByIndex[idx]
+		// Send done events for tool call items
+		for idx := range sentToolItems {
+			toolItemID := fmt.Sprintf("resp_tool_item_%s_%d", responseID, idx)
+			args := toolCallArgsByIndex[idx]
+			callID := toolCallIDByIndex[idx]
+			displayName := toolCallNameByIndex[idx]
+			if m, ok := toolMapping[displayName]; ok {
+				displayName = m.OriginalName
+			}
 
-				argsDone := fmt.Sprintf(`{"item_id":"%s","output_index":%d,"arguments":"%s"}`,
-					toolItemID, idx, jsonEscape(args))
-				sendResponsesSSE("response.function_call_arguments.done", argsDone)
+			argsDone := fmt.Sprintf(`{"item_id":"%s","output_index":%d,"arguments":"%s"}`,
+				toolItemID, idx, jsonEscape(args))
+			sendResponsesSSE("response.function_call_arguments.done", argsDone)
 
-				itemDone := map[string]any{
-					"id":        toolItemID,
-					"type":      "function_call",
-					"status":    "completed",
-					"call_id":   callID,
-					"name":      name,
-					"arguments": args,
-				}
+			itemDone := map[string]any{
+				"id":        toolItemID,
+				"type":      "function_call",
+				"status":    "completed",
+				"call_id":   callID,
+				"name":      displayName,
+				"arguments": args,
+			}
 				itemDoneJSON, _ := common.Marshal(itemDone)
 				sendResponsesSSE("response.output_item.done", string(itemDoneJSON))
 			}
@@ -414,7 +419,7 @@ func DeepSeekResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo,
 	return usage, nil
 }
 
-func buildResponsesResponseFromChat(chatResp *dto.OpenAITextResponse, responseID string, model string) *dto.OpenAIResponsesResponse {
+func buildResponsesResponseFromChat(chatResp *dto.OpenAITextResponse, responseID string, model string, toolMapping map[string]relaycommon.ResponseToolMapping) *dto.OpenAIResponsesResponse {
 	output := make([]dto.ResponsesOutput, 0)
 
 	for _, choice := range chatResp.Choices {
@@ -435,36 +440,21 @@ func buildResponsesResponseFromChat(chatResp *dto.OpenAITextResponse, responseID
 			}
 		}
 
-		if choice.Message.ReasoningContent != nil && *choice.Message.ReasoningContent != "" {
-			// Add reasoning as a separate output item
-			reasoningItem := dto.ResponsesOutput{
-				Type:   "message",
-				ID:     "resp_item_reasoning_" + responseID,
-				Role:   "assistant",
-				Status: "completed",
-				Content: []dto.ResponsesOutputContent{
-					{
-						Type: "output_text",
-						Text: "",
-					},
-				},
-			}
-			_ = reasoningItem
-			// reasoning is usually represented as reasoning_content in Chat, but
-			// Responses API puts it at the response level. For now, omit explicit
-			// reasoning output items since Chat API doesn't separate them clearly.
-		}
-
 		output = append(output, item)
 
-		// Tool calls
+		// Tool calls — use mapping to restore original tool info
 		for _, tc := range choice.Message.ParseToolCalls() {
+			callID := tc.ID
+			name := tc.Function.Name
+			if m, ok := toolMapping[name]; ok {
+				name = m.OriginalName
+			}
 			output = append(output, dto.ResponsesOutput{
 				Type:      "function_call",
-				ID:        "resp_tool_item_" + responseID + "_" + tc.ID,
+				ID:        "resp_tool_item_" + responseID + "_" + callID,
 				Status:    "completed",
-				CallId:    tc.ID,
-				Name:      tc.Function.Name,
+				CallId:    callID,
+				Name:      name,
 				Arguments: json.RawMessage(fmt.Sprintf(`"%s"`, jsonEscape(tc.Function.Arguments))),
 			})
 		}
@@ -499,4 +489,11 @@ func resolveResponseID(info *relaycommon.RelayInfo) string {
 		return info.ResponsesConversationInfo.NewResponseID
 	}
 	return "resp_" + common.GetTimeString() + common.GetRandomString(8)
+}
+
+func resolveToolMapping(info *relaycommon.RelayInfo) map[string]relaycommon.ResponseToolMapping {
+	if info.ResponsesConversationInfo != nil {
+		return info.ResponsesConversationInfo.ToolMapping
+	}
+	return nil
 }

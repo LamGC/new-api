@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -34,13 +35,74 @@ func (r *responsesInputItem) StringContent() string {
 	return ""
 }
 
+// ResponseToolEntry records the mapping from an upstream function name to its original Responses tool identity.
+type ResponseToolEntry struct {
+	UpstreamName string // sanitized function name sent to Chat upstream
+	SourceType   string // "function" or "custom_namespace"
+	OriginalName string // original tool name from Responses request
+	Namespace    string // custom namespace name (only for custom_namespace tools)
+}
+
+// ToolNameMapping maps upstream function names to their original Responses tool entries.
+type ToolNameMapping map[string]ResponseToolEntry
+
+// ResponsesToChatResult holds the converted Chat request and the tool name mapping.
+type ResponsesToChatResult struct {
+	ChatRequest *dto.GeneralOpenAIRequest
+	ToolMapping ToolNameMapping
+}
+
+var nonAlphaNum = regexp.MustCompile(`[^a-zA-Z0-9_-]`)
+var multiUnderscore = regexp.MustCompile(`_+`)
+
+func sanitizeFunctionName(name string) string {
+	name = strings.TrimSpace(name)
+	name = nonAlphaNum.ReplaceAllString(name, "_")
+	name = multiUnderscore.ReplaceAllString(name, "_")
+	name = strings.Trim(name, "_")
+	if len(name) > 64 {
+		name = name[:64]
+	}
+	if name == "" {
+		return "tool"
+	}
+	return name
+}
+
+func dedupeName(base string, used map[string]bool) string {
+	name := base
+	for i := 2; used[name]; i++ {
+		name = fmt.Sprintf("%s_%d", base, i)
+	}
+	used[name] = true
+	return name
+}
+
+// ResponsesRequestToChatRequestWithMapping converts a Responses API request and returns the tool mapping.
+func ResponsesRequestToChatRequestWithMapping(respReq *dto.OpenAIResponsesRequest) (*ResponsesToChatResult, error) {
+	chatReq, toolMapping, err := convertResponsesToChat(respReq)
+	if err != nil {
+		return nil, err
+	}
+	return &ResponsesToChatResult{
+		ChatRequest: chatReq,
+		ToolMapping: toolMapping,
+	}, nil
+}
+
 // ResponsesRequestToChatRequest converts an OpenAI Responses API request into a Chat Completions request.
+// Deprecated: use ResponsesRequestToChatRequestWithMapping to get tool name mappings.
 func ResponsesRequestToChatRequest(respReq *dto.OpenAIResponsesRequest) (*dto.GeneralOpenAIRequest, error) {
+	chatReq, _, err := convertResponsesToChat(respReq)
+	return chatReq, err
+}
+
+func convertResponsesToChat(respReq *dto.OpenAIResponsesRequest) (*dto.GeneralOpenAIRequest, ToolNameMapping, error) {
 	if respReq == nil {
-		return nil, errors.New("request is nil")
+		return nil, nil, errors.New("request is nil")
 	}
 	if respReq.Model == "" {
-		return nil, errors.New("model is required")
+		return nil, nil, errors.New("model is required")
 	}
 
 	chatReq := &dto.GeneralOpenAIRequest{
@@ -59,33 +121,9 @@ func ResponsesRequestToChatRequest(respReq *dto.OpenAIResponsesRequest) (*dto.Ge
 		chatReq.ReasoningEffort = respReq.Reasoning.Effort
 	}
 
-	// Map tools
-	respTools := respReq.GetToolsMap()
-	if len(respTools) > 0 {
-		chatTools := make([]dto.ToolCallRequest, 0, len(respTools))
-		for _, tool := range respTools {
-			toolType := common.Interface2String(tool["type"])
-			switch toolType {
-			case "function":
-				chatTools = append(chatTools, dto.ToolCallRequest{
-					Type: "function",
-					Function: dto.FunctionRequest{
-						Name:        common.Interface2String(tool["name"]),
-						Description: common.Interface2String(tool["description"]),
-						Parameters:  tool["parameters"],
-					},
-				})
-			default:
-				// Pass through unknown tool types
-				toolJSON, _ := common.Marshal(tool)
-				chatTools = append(chatTools, dto.ToolCallRequest{
-					Type:   dto.CustomType,
-					Custom: toolJSON,
-				})
-			}
-		}
-		chatReq.Tools = chatTools
-	}
+	// Map tools with whitelist + flatten + sanitize
+	chatTools, toolMapping := convertResponsesToolsToChatTools(respReq)
+	chatReq.Tools = chatTools
 
 	// Map tool_choice
 	chatReq.ToolChoice = mapResponsesToolChoiceToChat(respReq)
@@ -102,13 +140,123 @@ func ResponsesRequestToChatRequest(respReq *dto.OpenAIResponsesRequest) (*dto.Ge
 	// Map input items → messages
 	inputMsgs, err := mapResponsesInputToMessages(respReq.Input)
 	if err != nil {
-		return nil, fmt.Errorf("parse responses input: %w", err)
+		return nil, nil, fmt.Errorf("parse responses input: %w", err)
 	}
 	messages = append(messages, inputMsgs...)
 
 	chatReq.Messages = messages
 
-	return chatReq, nil
+	return chatReq, toolMapping, nil
+}
+
+func convertResponsesToolsToChatTools(respReq *dto.OpenAIResponsesRequest) ([]dto.ToolCallRequest, ToolNameMapping) {
+	respTools := respReq.GetToolsMap()
+	if len(respTools) == 0 {
+		return nil, nil
+	}
+
+	chatTools := make([]dto.ToolCallRequest, 0)
+	mapping := make(ToolNameMapping)
+	usedNames := make(map[string]bool)
+
+	for _, tool := range respTools {
+		toolType := common.Interface2String(tool["type"])
+
+		switch toolType {
+		case "function":
+			originalName := common.Interface2String(tool["name"])
+			upstreamName := dedupeName(sanitizeFunctionName(originalName), usedNames)
+
+			params := tool["parameters"]
+			// Remove strict if present (unsupported by many Chat providers)
+			if paramMap, ok := params.(map[string]any); ok {
+				delete(paramMap, "strict")
+			}
+
+			chatTools = append(chatTools, dto.ToolCallRequest{
+				Type: "function",
+				Function: dto.FunctionRequest{
+					Name:        upstreamName,
+					Description: common.Interface2String(tool["description"]),
+					Parameters:  params,
+				},
+			})
+			mapping[upstreamName] = ResponseToolEntry{
+				UpstreamName: upstreamName,
+				SourceType:   "function",
+				OriginalName: originalName,
+			}
+
+		case "custom":
+			custom, _ := tool["custom"].(map[string]any)
+			if custom == nil {
+				continue
+			}
+			customType := common.Interface2String(custom["type"])
+
+			if customType == "namespace" {
+				// Flatten namespace children into individual function tools
+				namespace := sanitizeFunctionName(common.Interface2String(custom["name"]))
+				if namespace == "" {
+					namespace = "ns"
+				}
+				children := flattenCustomNamespaceTools(custom, namespace, usedNames, mapping)
+				chatTools = append(chatTools, children...)
+			}
+			// web_search, file_search, etc. → drop (no executor)
+
+		default:
+			// web_search, web_search_preview, file_search, mcp, code_interpreter,
+			// computer_use, image_generation, local_shell, tool_search → drop
+		}
+	}
+
+	if len(chatTools) == 0 {
+		return nil, nil
+	}
+	return chatTools, mapping
+}
+
+func flattenCustomNamespaceTools(custom map[string]any, namespace string, usedNames map[string]bool, mapping ToolNameMapping) []dto.ToolCallRequest {
+	children, _ := custom["tools"].([]any)
+	if len(children) == 0 {
+		return nil
+	}
+
+	var result []dto.ToolCallRequest
+	for _, childAny := range children {
+		child, ok := childAny.(map[string]any)
+		if !ok {
+			continue
+		}
+		if common.Interface2String(child["type"]) != "function" {
+			continue
+		}
+
+		originalName := common.Interface2String(child["name"])
+		upstreamName := dedupeName(sanitizeFunctionName(namespace+"_"+originalName), usedNames)
+
+		params := child["parameters"]
+		if paramMap, ok := params.(map[string]any); ok {
+			delete(paramMap, "strict")
+		}
+
+		result = append(result, dto.ToolCallRequest{
+			Type: "function",
+			Function: dto.FunctionRequest{
+				Name:        upstreamName,
+				Description: common.Interface2String(child["description"]),
+				Parameters:  params,
+			},
+		})
+		mapping[upstreamName] = ResponseToolEntry{
+			UpstreamName: upstreamName,
+			SourceType:   "custom_namespace",
+			OriginalName: originalName,
+			Namespace:    namespace,
+		}
+	}
+	return result
 }
 
 func mapResponsesInstructionsToSystemMessage(instructions json.RawMessage) dto.Message {

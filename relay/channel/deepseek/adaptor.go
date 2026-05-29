@@ -185,10 +185,11 @@ func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommo
 	}
 
 	// Convert new input to Chat messages
-	chatReq, err := openaicompat.ResponsesRequestToChatRequest(&request)
+	result, err := openaicompat.ResponsesRequestToChatRequestWithMapping(&request)
 	if err != nil {
 		return nil, fmt.Errorf("convert responses to chat: %w", err)
 	}
+	chatReq := result.ChatRequest
 
 	// Merge history on top (history first, then new messages)
 	fullMessages := append(historyMessages, chatReq.Messages...)
@@ -204,11 +205,23 @@ func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommo
 		info.AppendRequestConversion(types.RelayFormatOpenAI)
 		info.FinalRequestRelayFormat = types.RelayFormatOpenAI
 
-		// Store full messages for post-response conversation storage
+		// Build tool mapping for response conversion
+		toolMapping := make(map[string]relaycommon.ResponseToolMapping)
+		for name, entry := range result.ToolMapping {
+			toolMapping[name] = relaycommon.ResponseToolMapping{
+				UpstreamName: entry.UpstreamName,
+				SourceType:   entry.SourceType,
+				OriginalName: entry.OriginalName,
+				Namespace:    entry.Namespace,
+			}
+		}
+
+		// Store full messages + tool mapping for post-response conversation storage
 		info.ResponsesConversationInfo = &relaycommon.ResponsesConversationInfo{
 			FullMessages:       fullMessages,
 			PreviousResponseID: request.PreviousResponseID,
 			NewResponseID:      "resp_" + common.GetTimeString() + common.GetRandomString(8),
+			ToolMapping:        toolMapping,
 		}
 	}
 

@@ -2,6 +2,7 @@ package openaicompat
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -331,5 +332,192 @@ func TestResponsesRequestToChatRequest_DeveloperRoleMapping(t *testing.T) {
 	}
 	if result.Messages[1].Role != "user" {
 		t.Errorf("expected user role, got %q", result.Messages[1].Role)
+	}
+}
+
+func TestResponsesRequestToChatRequest_ToolWhitelistAndSanitize(t *testing.T) {
+	req := &dto.OpenAIResponsesRequest{
+		Model: "deepseek-chat",
+		Input: mustJSON([]map[string]any{
+			{"role": "user", "content": "Hello"},
+		}),
+		Tools: mustJSON([]map[string]any{
+			{"type": "function", "name": "get_weather", "description": "Get weather", "parameters": map[string]any{"type": "object"}},
+			{"type": "function", "name": "search docs", "description": "Search docs"},
+			{"type": "web_search"},
+			{"type": "file_search"},
+			{"type": "custom", "custom": map[string]any{"external_web_access": false, "type": "web_search"}},
+		}),
+	}
+
+	result, err := ResponsesRequestToChatRequestWithMapping(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Only function tools should survive; web_search and file_search dropped
+	if len(result.ChatRequest.Tools) != 2 {
+		t.Fatalf("expected 2 tools (function only), got %d", len(result.ChatRequest.Tools))
+	}
+
+	// First tool: original name preserved via mapping
+	if result.ChatRequest.Tools[0].Function.Name != "get_weather" {
+		t.Errorf("expected tool name get_weather, got %s", result.ChatRequest.Tools[0].Function.Name)
+	}
+	if _, ok := result.ToolMapping["get_weather"]; !ok {
+		t.Error("mapping should contain get_weather")
+	}
+
+	// Second tool: name with spaces should be sanitized
+	secondName := result.ChatRequest.Tools[1].Function.Name
+	if strings.Contains(secondName, " ") {
+		t.Errorf("tool name should not contain spaces, got %q", secondName)
+	}
+}
+
+func TestResponsesRequestToChatRequest_CustomNamespaceFlatten(t *testing.T) {
+	req := &dto.OpenAIResponsesRequest{
+		Model: "deepseek-chat",
+		Input: mustJSON([]map[string]any{
+			{"role": "user", "content": "Hello"},
+		}),
+		Tools: mustJSON([]map[string]any{
+			{
+				"type": "custom",
+				"custom": map[string]any{
+					"name": "multi_agent_v1",
+					"type": "namespace",
+					"tools": []map[string]any{
+						{"type": "function", "name": "spawn_agent", "description": "Spawn agent"},
+						{"type": "function", "name": "close_agent", "description": "Close agent"},
+						{"type": "web_search"},
+					},
+				},
+			},
+			{"type": "function", "name": "get_weather", "description": "Get weather"},
+		}),
+	}
+
+	result, err := ResponsesRequestToChatRequestWithMapping(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Should flatten namespace + keep the standalone function = 3 tools
+	if len(result.ChatRequest.Tools) != 3 {
+		t.Fatalf("expected 3 tools (2 namespace children + 1 standalone), got %d", len(result.ChatRequest.Tools))
+	}
+
+	// Flattened tools should have namespace prefix
+	foundSpawn := false
+	for _, tool := range result.ChatRequest.Tools {
+		if strings.Contains(tool.Function.Name, "spawn_agent") {
+			foundSpawn = true
+			if m, ok := result.ToolMapping[tool.Function.Name]; !ok {
+				t.Errorf("mapping should contain %s", tool.Function.Name)
+			} else if m.SourceType != "custom_namespace" {
+				t.Errorf("expected custom_namespace, got %s", m.SourceType)
+			} else if m.Namespace != "multi_agent_v1" {
+				t.Errorf("expected namespace multi_agent_v1, got %s", m.Namespace)
+			}
+		}
+	}
+	if !foundSpawn {
+		t.Error("should have found spawn_agent tool after flatten")
+	}
+}
+
+func TestResponsesRequestToChatRequest_NameDeduplication(t *testing.T) {
+	req := &dto.OpenAIResponsesRequest{
+		Model: "deepseek-chat",
+		Input: mustJSON([]map[string]any{
+			{"role": "user", "content": "Hello"},
+		}),
+		Tools: mustJSON([]map[string]any{
+			{"type": "function", "name": "search", "description": "Search 1"},
+			{"type": "function", "name": "search", "description": "Search 2"},
+			{"type": "function", "name": "search", "description": "Search 3"},
+		}),
+	}
+
+	result, err := ResponsesRequestToChatRequestWithMapping(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(result.ChatRequest.Tools) != 3 {
+		t.Fatalf("expected 3 tools, got %d", len(result.ChatRequest.Tools))
+	}
+
+	names := make(map[string]bool)
+	for _, tool := range result.ChatRequest.Tools {
+		if names[tool.Function.Name] {
+			t.Errorf("duplicate tool name: %s", tool.Function.Name)
+		}
+		names[tool.Function.Name] = true
+	}
+
+	if !names["search"] {
+		t.Error("should have first occurrence as search")
+	}
+	if !names["search_2"] || !names["search_3"] {
+		t.Error("should have search_2 and search_3")
+	}
+}
+
+func TestResponsesRequestToChatRequest_StrictStripped(t *testing.T) {
+	req := &dto.OpenAIResponsesRequest{
+		Model: "deepseek-chat",
+		Input: mustJSON([]map[string]any{
+			{"role": "user", "content": "Hello"},
+		}),
+		Tools: mustJSON([]map[string]any{
+			{
+				"type": "function",
+				"name": "get_weather",
+				"parameters": map[string]any{
+					"type": "object",
+					"strict": true,
+					"properties": map[string]any{"city": map[string]any{"type": "string"}},
+				},
+			},
+		}),
+	}
+
+	result, err := ResponsesRequestToChatRequestWithMapping(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if paramMap, ok := result.ChatRequest.Tools[0].Function.Parameters.(map[string]any); ok {
+		if _, exists := paramMap["strict"]; exists {
+			t.Error("strict should have been stripped from parameters")
+		}
+	}
+}
+
+func TestResponsesRequestToChatRequest_AllNonFunctionToolsDropped(t *testing.T) {
+	req := &dto.OpenAIResponsesRequest{
+		Model: "deepseek-chat",
+		Input: mustJSON([]map[string]any{
+			{"role": "user", "content": "Hello"},
+		}),
+		Tools: mustJSON([]map[string]any{
+			{"type": "web_search"},
+			{"type": "web_search_preview"},
+			{"type": "file_search"},
+			{"type": "mcp"},
+			{"type": "code_interpreter"},
+			{"type": "custom", "custom": map[string]any{"name": "web_search", "type": "web_search"}},
+		}),
+	}
+
+	result, err := ResponsesRequestToChatRequestWithMapping(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(result.ChatRequest.Tools) != 0 {
+		t.Fatalf("expected 0 tools (all non-function dropped), got %d", len(result.ChatRequest.Tools))
 	}
 }
