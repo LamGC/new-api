@@ -1,0 +1,87 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'  # every 6 hours
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      has_changes: ${{ steps.check.outputs.has_changes }}
+    steps:
+      - name: Checkout main-fork
+        uses: actions/checkout@v4
+        with:
+          ref: main-fork
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/QuantumNous/new-api.git
+          git fetch upstream main
+
+      - name: Check if upstream has new commits
+        id: check
+        run: |
+          UPSTREAM_HEAD=$(git rev-parse upstream/main)
+          BRANCH_HEAD=$(git rev-parse HEAD)
+
+          # Find the last merge-base (common ancestor)
+          MERGE_BASE=$(git merge-base upstream/main HEAD)
+
+          if [ "$MERGE_BASE" = "$UPSTREAM_HEAD" ]; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "No new upstream changes."
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "has_changes=true"
+            echo "MERGE_BASE=${MERGE_BASE}" >> $GITHUB_ENV
+            echo "UPSTREAM_HEAD=${UPSTREAM_HEAD}" >> $GITHUB_ENV
+            echo "New upstream commits detected."
+          fi
+
+      - name: Create PR branch
+        if: steps.check.outputs.has_changes == 'true'
+        run: |
+          git checkout main-fork
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+          echo "BRANCH=upstream-sync-${TIMESTAMP}" >> $GITHUB_ENV
+          git checkout -b upstream-sync-${TIMESTAMP}
+          git merge upstream/main --no-edit -m "sync: merge upstream/main" || true
+          git push origin upstream-sync-${TIMESTAMP}
+
+      - name: Check for existing sync PR
+        if: steps.check.outputs.has_changes == 'true'
+        id: existing
+        run: |
+          gh pr list --base main-fork --head "${BRANCH}" --json number --jq '.[0].number' > existing.txt 2>/dev/null || echo "" > existing.txt
+          EXISTING=$(cat existing.txt)
+          if [ -n "$EXISTING" ]; then
+            echo "number=$EXISTING" >> $GITHUB_OUTPUT
+            echo "Found existing PR #$EXISTING"
+          else
+            echo "number=" >> $GITHUB_OUTPUT
+            echo "No existing PR"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create PR
+        if: steps.check.outputs.has_changes == 'true' && steps.existing.outputs.number == ''
+        run: |
+          gh pr create \
+            --base main-fork \
+            --head "${BRANCH}" \
+            --title "sync: merge upstream/main into main-fork ($(date +%Y-%m-%d))" \
+            --body "Automated sync from [upstream/main](https://github.com/QuantumNous/new-api/commits/main). Please review before merging.
+
+          ${MERGE_BASE:0:7}...${UPSTREAM_HEAD:0:7}" \
+            --label "upstream-sync"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
