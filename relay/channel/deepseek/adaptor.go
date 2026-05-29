@@ -13,7 +13,8 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel/claude"
 	"github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
-	"github.com/QuantumNous/new-api/relay/constant"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+	"github.com/QuantumNous/new-api/service/openaicompat"
 	"github.com/QuantumNous/new-api/setting/reasoning"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
@@ -66,7 +67,7 @@ func (a *Adaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
 			fimBaseUrl += "/beta"
 		}
 		switch info.RelayMode {
-		case constant.RelayModeCompletions:
+		case relayconstant.RelayModeCompletions:
 			return fmt.Sprintf("%s/completions", fimBaseUrl), nil
 		default:
 			return fmt.Sprintf("%s/v1/chat/completions", info.ChannelBaseUrl), nil
@@ -159,8 +160,38 @@ func (a *Adaptor) ConvertEmbeddingRequest(c *gin.Context, info *relaycommon.Rela
 }
 
 func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.OpenAIResponsesRequest) (any, error) {
-	// TODO implement me
-	return nil, errors.New("not implemented")
+	// Parse reasoning effort from model suffix
+	effort, originModel := reasoning.ParseOpenAIReasoningEffortFromModelSuffix(request.Model)
+	if effort != "" {
+		if request.Reasoning == nil {
+			request.Reasoning = &dto.Reasoning{Effort: effort}
+		} else {
+			request.Reasoning.Effort = effort
+		}
+		request.Model = originModel
+	}
+	if info != nil && request.Reasoning != nil && request.Reasoning.Effort != "" {
+		info.ReasoningEffort = request.Reasoning.Effort
+	}
+
+	// Convert Responses → Chat format for DeepSeek upstream
+	chatReq, err := openaicompat.ResponsesRequestToChatRequest(&request)
+	if err != nil {
+		return nil, fmt.Errorf("convert responses to chat: %w", err)
+	}
+
+	// Apply DeepSeek V4 thinking suffix handling (same as ConvertOpenAIRequest)
+	if err := applyDeepSeekV4OpenAIThinkingSuffix(info, chatReq); err != nil {
+		return nil, err
+	}
+
+	// Record the conversion in the chain
+	if info != nil {
+		info.AppendRequestConversion(types.RelayFormatOpenAI)
+		info.FinalRequestRelayFormat = types.RelayFormatOpenAI
+	}
+
+	return chatReq, nil
 }
 
 func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (any, error) {
@@ -168,6 +199,14 @@ func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, request
 }
 
 func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (usage any, err *types.NewAPIError) {
+	// For Responses mode, convert Chat response back to Responses format
+	if info.RelayMode == relayconstant.RelayModeResponses {
+		if info.IsStream {
+			return DeepSeekResponsesStreamHandler(c, info, resp)
+		}
+		return DeepSeekResponsesHandler(c, info, resp)
+	}
+
 	switch info.RelayFormat {
 	case types.RelayFormatClaude:
 		adaptor := claude.Adaptor{}
