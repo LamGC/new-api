@@ -156,6 +156,17 @@ func ClaudeToOpenAIRequest(claudeRequest dto.ClaudeRequest, info *relaycommon.Re
 						CacheControl: mediaMsg.CacheControl,
 					}
 					mediaMessages = append(mediaMessages, message)
+			case "thinking":
+				// Claude thinking blocks must be passed back to the API in thinking mode.
+				// Map them to OpenAI reasoning_content on assistant messages.
+				if claudeMessage.Role == "assistant" && mediaMsg.Thinking != nil {
+					if openAIMessage.ReasoningContent != nil {
+						combined := *openAIMessage.ReasoningContent + "\n" + *mediaMsg.Thinking
+						openAIMessage.ReasoningContent = &combined
+					} else {
+						openAIMessage.ReasoningContent = mediaMsg.Thinking
+					}
+				}
 				case "image":
 					// Handle image conversion (base64 to URL or keep as is)
 					imageData := fmt.Sprintf("data:%s;base64,%s", mediaMsg.Source.MediaType, mediaMsg.Source.Data)
@@ -206,7 +217,7 @@ func ClaudeToOpenAIRequest(claudeRequest dto.ClaudeRequest, info *relaycommon.Re
 				openAIMessage.SetMediaContent(mediaMessages)
 			}
 		}
-		if len(openAIMessage.ParseContent()) > 0 || len(openAIMessage.ToolCalls) > 0 {
+		if len(openAIMessage.ParseContent()) > 0 || len(openAIMessage.ToolCalls) > 0 || openAIMessage.ReasoningContent != nil {
 			openAIMessages = append(openAIMessages, openAIMessage)
 		}
 	}
