@@ -198,6 +198,12 @@ func DeepSeekResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo,
 
 		// Handle tool calls
 		if len(delta.ToolCalls) > 0 {
+			// Close text output if it was in progress before tool calls start
+			if !hasToolCalls && sentContentPart {
+				sendResponsesSSE("response.output_text.done",
+					fmt.Sprintf(`{"item_id":"%s","output_index":0,"content_index":0,"text":"%s"}`,
+						itemID, jsonEscape(responseText.String())))
+			}
 			hasToolCalls = true
 			for _, tc := range delta.ToolCalls {
 				idx := 0
@@ -304,16 +310,16 @@ func DeepSeekResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo,
 				*usage = *streamResp.Usage
 			}
 
-			// Send done events for text items
-			if !hasToolCalls && sentContentPart {
-				sendResponsesSSE("response.output_text.done",
-					fmt.Sprintf(`{"item_id":"%s","output_index":0,"content_index":0,"text":"%s"}`,
-						itemID, jsonEscape(responseText.String())))
+		// Send done events for text items (fires even when tool calls present)
+		if sentContentPart {
+			sendResponsesSSE("response.output_text.done",
+				fmt.Sprintf(`{"item_id":"%s","output_index":0,"content_index":0,"text":"%s"}`,
+					itemID, jsonEscape(responseText.String())))
 
-				sendResponsesSSE("response.content_part.done",
-					fmt.Sprintf(`{"item_id":"%s","output_index":0,"content_index":0,"part":{"type":"output_text","text":"%s"}}`,
-						itemID, jsonEscape(responseText.String())))
-			}
+			sendResponsesSSE("response.content_part.done",
+				fmt.Sprintf(`{"item_id":"%s","output_index":0,"content_index":0,"part":{"type":"output_text","text":"%s"}}`,
+					itemID, jsonEscape(responseText.String())))
+		}
 
 		// Send done events for tool call items
 		for idx := range sentToolItems {
@@ -329,46 +335,46 @@ func DeepSeekResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo,
 				toolItemID, idx, jsonEscape(args))
 			sendResponsesSSE("response.function_call_arguments.done", argsDone)
 
-			itemDone := map[string]any{
-				"id":        toolItemID,
-				"type":      "function_call",
-				"status":    "completed",
-				"call_id":   callID,
-				"name":      displayName,
-				"arguments": args,
-			}
-				itemDoneJSON, _ := common.Marshal(itemDone)
-				sendResponsesSSE("response.output_item.done", string(itemDoneJSON))
-			}
+		itemDone := map[string]any{
+			"id":        toolItemID,
+			"type":      "function_call",
+			"status":    "completed",
+			"call_id":   callID,
+			"name":      displayName,
+			"arguments": args,
+		}
+		itemDoneJSON, _ := common.Marshal(itemDone)
+		sendResponsesSSE("response.output_item.done", string(itemDoneJSON))
+	}
 
-			// Send output_item.done for text message
-			if !hasToolCalls && sentItemAdded {
-				outputItem := map[string]any{
-					"id":     itemID,
-					"type":   "message",
-					"role":   "assistant",
-					"status": "completed",
-					"content": []map[string]any{
-						{"type": "output_text", "text": responseText.String()},
-					},
-				}
-				itemDoneJSON, _ := common.Marshal(outputItem)
-				sendResponsesSSE("response.output_item.done", string(itemDoneJSON))
+		// Send output_item.done for text message (fires even when tool calls present)
+		if sentItemAdded {
+			outputItem := map[string]any{
+				"id":     itemID,
+				"type":   "message",
+				"role":   "assistant",
+				"status": "completed",
+				"content": []map[string]any{
+					{"type": "output_text", "text": responseText.String()},
+				},
 			}
+			itemDoneJSON, _ := common.Marshal(outputItem)
+			sendResponsesSSE("response.output_item.done", string(itemDoneJSON))
+		}
 
-			if hasSentReasoning {
-				sendResponsesSSE("response.reasoning_summary_text.done",
-					fmt.Sprintf(`{"item_id":"%s","summary_index":0,"text":"%s"}`, itemID, jsonEscape(reasoning)))
-			}
+	if hasSentReasoning {
+		sendResponsesSSE("response.reasoning_summary_text.done",
+			fmt.Sprintf(`{"item_id":"%s","summary_index":0,"text":"%s"}`, itemID, jsonEscape(reasoning)))
+	}
 
 			// Send response.completed
 			completedEvent := map[string]any{
-				"id":      responseID,
-				"object":  "response",
-				"model":   model,
-				"status":  "completed",
+				"id":         responseID,
+				"object":     "response",
+				"model":      model,
+				"status":     "completed",
 				"created_at": createdAt,
-				"usage":   usage,
+				"usage":      usage,
 			}
 			completedJSON, _ := common.Marshal(completedEvent)
 			if err := sendResponsesSSE("response.completed", string(completedJSON)); err != nil {
