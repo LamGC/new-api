@@ -303,3 +303,33 @@ func TestResponsesRequestToChatRequest_ImageContent(t *testing.T) {
 		t.Error("expected image content, none found")
 	}
 }
+
+func TestResponsesRequestToChatRequest_DeveloperRoleMapping(t *testing.T) {
+	req := &dto.OpenAIResponsesRequest{
+		Model: "deepseek-chat",
+		Input: mustJSON([]map[string]any{
+			{"role": "developer", "content": "You are a helpful coding assistant."},
+			{"role": "user", "content": "Write a function."},
+		}),
+	}
+
+	result, err := ResponsesRequestToChatRequest(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(result.Messages) != 2 {
+		t.Fatalf("expected 2 messages, got %d", len(result.Messages))
+	}
+
+	// "developer" role should be mapped to "system"
+	if result.Messages[0].Role != "system" {
+		t.Errorf("expected developer→system mapping, got role %q", result.Messages[0].Role)
+	}
+	if result.Messages[0].StringContent() != "You are a helpful coding assistant." {
+		t.Errorf("unexpected content: %q", result.Messages[0].StringContent())
+	}
+	if result.Messages[1].Role != "user" {
+		t.Errorf("expected user role, got %q", result.Messages[1].Role)
+	}
+}

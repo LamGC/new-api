@@ -213,6 +213,11 @@ func mapResponsesInputToMessages(input json.RawMessage) ([]dto.Message, error) {
 		if role == "" {
 			role = "user"
 		}
+		// Map Responses API roles to Chat Completions roles.
+		// DeepSeek and many other providers do not support "developer".
+		if role == "developer" {
+			role = "system"
+		}
 
 		msg := dto.Message{Role: role}
 
