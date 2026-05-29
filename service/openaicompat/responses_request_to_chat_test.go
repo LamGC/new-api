@@ -521,3 +521,173 @@ func TestResponsesRequestToChatRequest_AllNonFunctionToolsDropped(t *testing.T) 
 		t.Fatalf("expected 0 tools (all non-function dropped), got %d", len(result.ChatRequest.Tools))
 	}
 }
+
+func TestResponsesRequestToChatRequest_ToolChoiceRequiredDowngrade(t *testing.T) {
+	req := &dto.OpenAIResponsesRequest{
+		Model:      "deepseek-chat",
+		ToolChoice: mustJSON("required"),
+		Input: mustJSON([]map[string]any{
+			{"role": "user", "content": "Hello"},
+		}),
+	}
+
+	result, err := ResponsesRequestToChatRequest(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	tc, ok := result.ToolChoice.(string)
+	if !ok || tc != "auto" {
+		t.Errorf("expected tool_choice 'auto' (downgraded from required), got %v", result.ToolChoice)
+	}
+}
+
+func TestResponsesRequestToChatRequest_ToolChoiceAutoPassThrough(t *testing.T) {
+	req := &dto.OpenAIResponsesRequest{
+		Model:      "deepseek-chat",
+		ToolChoice: mustJSON("auto"),
+		Input: mustJSON([]map[string]any{
+			{"role": "user", "content": "Hello"},
+		}),
+	}
+
+	result, err := ResponsesRequestToChatRequest(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	tc, ok := result.ToolChoice.(string)
+	if !ok || tc != "auto" {
+		t.Errorf("expected tool_choice 'auto', got %v", result.ToolChoice)
+	}
+}
+
+func TestResponsesRequestToChatRequest_ToolChoiceCustomDowngrade(t *testing.T) {
+	req := &dto.OpenAIResponsesRequest{
+		Model: "deepseek-chat",
+		ToolChoice: mustJSON(map[string]any{
+			"type": "custom",
+			"name": "multi_agent_v1",
+		}),
+		Input: mustJSON([]map[string]any{
+			{"role": "user", "content": "Hello"},
+		}),
+	}
+
+	result, err := ResponsesRequestToChatRequest(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	tc, ok := result.ToolChoice.(string)
+	if !ok || tc != "auto" {
+		t.Errorf("expected custom namespace tool_choice downgraded to 'auto', got %v", result.ToolChoice)
+	}
+}
+
+func TestResponsesRequestToChatRequest_TextFormatToResponseFormat(t *testing.T) {
+	req := &dto.OpenAIResponsesRequest{
+		Model: "deepseek-chat",
+		Text: mustJSON(map[string]any{
+			"format": map[string]any{
+				"type": "json_schema",
+				"name": "math_response",
+				"schema": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"result": map[string]any{"type": "string"},
+					},
+				},
+			},
+		}),
+		Input: mustJSON([]map[string]any{
+			{"role": "user", "content": "Hello"},
+		}),
+	}
+
+	result, err := ResponsesRequestToChatRequest(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if result.ResponseFormat == nil {
+		t.Fatal("expected ResponseFormat to be set")
+	}
+	if result.ResponseFormat.Type != "json_schema" {
+		t.Errorf("expected json_schema, got %s", result.ResponseFormat.Type)
+	}
+}
+
+func TestResponsesRequestToChatRequest_JsonSchemaDowngrade(t *testing.T) {
+	req := &dto.OpenAIResponsesRequest{
+		Model: "deepseek-chat",
+		Input: mustJSON([]map[string]any{
+			{"role": "user", "content": "Hello"},
+		}),
+		Tools: mustJSON([]map[string]any{
+			{
+				"type": "function",
+				"name": "search",
+				"parameters": map[string]any{
+					"type":       "object",
+					"$schema":    "http://json-schema.org/draft-07/schema#",
+					"oneOf":      []any{map[string]any{"type": "string"}},
+					"anyOf":      []any{map[string]any{"type": "integer"}},
+					"allOf":      []any{map[string]any{"type": "boolean"}},
+					"patternProperties": map[string]any{"^key": map[string]any{"type": "string"}},
+					"properties": map[string]any{
+						"query": map[string]any{
+							"type":    "string",
+							"$schema": "should_be_removed",
+						},
+					},
+				},
+			},
+		}),
+	}
+
+	result, err := ResponsesRequestToChatRequestWithMapping(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	params, ok := result.ChatRequest.Tools[0].Function.Parameters.(map[string]any)
+	if !ok {
+		t.Fatal("parameters should be a map")
+	}
+
+	for _, forbidden := range []string{"$schema", "oneOf", "anyOf", "allOf", "patternProperties"} {
+		if _, exists := params[forbidden]; exists {
+			t.Errorf("forbidden key %q should have been removed", forbidden)
+		}
+	}
+
+	// Nested properties should also have $schema removed
+	if props, ok := params["properties"].(map[string]any); ok {
+		if nested, ok := props["query"].(map[string]any); ok {
+			if _, exists := nested["$schema"]; exists {
+				t.Errorf("nested $schema should have been removed")
+			}
+		}
+	}
+}
+
+func TestResponsesRequestToChatRequest_ToolChoiceNone(t *testing.T) {
+	req := &dto.OpenAIResponsesRequest{
+		Model:      "deepseek-chat",
+		ToolChoice: mustJSON("none"),
+		Input: mustJSON([]map[string]any{
+			{"role": "user", "content": "Hello"},
+		}),
+	}
+
+	result, err := ResponsesRequestToChatRequest(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	tc, ok := result.ToolChoice.(string)
+	if !ok || tc != "none" {
+		t.Errorf("expected tool_choice 'none', got %v", result.ToolChoice)
+	}
+}

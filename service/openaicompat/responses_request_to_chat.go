@@ -125,8 +125,13 @@ func convertResponsesToChat(respReq *dto.OpenAIResponsesRequest) (*dto.GeneralOp
 	chatTools, toolMapping := convertResponsesToolsToChatTools(respReq)
 	chatReq.Tools = chatTools
 
-	// Map tool_choice
+	// Map tool_choice with downgrade for unsupported modes
 	chatReq.ToolChoice = mapResponsesToolChoiceToChat(respReq)
+
+	// Map text.format → response_format (structured outputs)
+	if len(respReq.Text) > 0 {
+		chatReq.ResponseFormat = mapResponsesTextToResponseFormat(respReq.Text)
+	}
 
 	// Map instructions → system message
 	messages := make([]dto.Message, 0)
@@ -167,7 +172,7 @@ func convertResponsesToolsToChatTools(respReq *dto.OpenAIResponsesRequest) ([]dt
 			originalName := common.Interface2String(tool["name"])
 			upstreamName := dedupeName(sanitizeFunctionName(originalName), usedNames)
 
-			params := tool["parameters"]
+			params := downgradeToolParameters(tool["parameters"])
 			// Remove strict if present (unsupported by many Chat providers)
 			if paramMap, ok := params.(map[string]any); ok {
 				delete(paramMap, "strict")
@@ -236,7 +241,7 @@ func flattenCustomNamespaceTools(custom map[string]any, namespace string, usedNa
 		originalName := common.Interface2String(child["name"])
 		upstreamName := dedupeName(sanitizeFunctionName(namespace+"_"+originalName), usedNames)
 
-		params := child["parameters"]
+		params := downgradeToolParameters(child["parameters"])
 		if paramMap, ok := params.(map[string]any); ok {
 			delete(paramMap, "strict")
 		}
@@ -299,6 +304,10 @@ func mapResponsesToolChoiceToChat(respReq *dto.OpenAIResponsesRequest) any {
 
 	switch v := raw.(type) {
 	case string:
+		// "required" is not supported by most Chat providers; downgrade to "auto"
+		if v == "required" {
+			return "auto"
+		}
 		return v
 	case map[string]any:
 		toolType := common.Interface2String(v["type"])
@@ -313,10 +322,83 @@ func mapResponsesToolChoiceToChat(respReq *dto.OpenAIResponsesRequest) any {
 				}
 			}
 		}
+		if toolType == "custom" {
+			// Custom namespace tool_choice cannot be mapped to Chat — downgrade to auto
+			return "auto"
+		}
 		return v
 	default:
 		return raw
 	}
+}
+
+// mapResponsesTextToResponseFormat converts Responses text.format to Chat response_format.
+func mapResponsesTextToResponseFormat(text json.RawMessage) *dto.ResponseFormat {
+	var textObj map[string]any
+	if err := common.Unmarshal(text, &textObj); err != nil {
+		return nil
+	}
+	format, ok := textObj["format"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	formatType := common.Interface2String(format["type"])
+	if formatType == "" {
+		return nil
+	}
+	rf := &dto.ResponseFormat{Type: formatType}
+	if formatType == "json_schema" {
+		schema := make(map[string]any)
+		for k, v := range format {
+			if k == "type" {
+				continue
+			}
+			schema[k] = v
+		}
+		if js, ok := format["json_schema"].(map[string]any); ok {
+			for k, v := range js {
+				if _, exists := schema[k]; !exists {
+					schema[k] = v
+				}
+			}
+		}
+		schemaJSON, err := common.Marshal(schema)
+		if err == nil {
+			rf.JsonSchema = json.RawMessage(schemaJSON)
+		}
+	}
+	return rf
+}
+
+// downgradeJsonSchema recursively removes features that many Chat providers don't support.
+func downgradeJsonSchema(schema map[string]any) map[string]any {
+	if schema == nil {
+		return nil
+	}
+	keysToDelete := []string{"$schema", "$id", "definitions", "$defs",
+		"oneOf", "anyOf", "allOf", "not",
+		"patternProperties", "unevaluatedProperties", "dependentSchemas"}
+	for _, k := range keysToDelete {
+		delete(schema, k)
+	}
+	for _, k := range []string{"properties", "patternProperties"} {
+		if v, ok := schema[k].(map[string]any); ok && len(v) > 0 {
+			for ck, cv := range v {
+				if cm, ok := cv.(map[string]any); ok {
+					v[ck] = downgradeJsonSchema(cm)
+				}
+			}
+		}
+	}
+	return schema
+}
+
+func downgradeToolParameters(params any) any {
+	paramMap, ok := params.(map[string]any)
+	if !ok {
+		return params
+	}
+	return downgradeJsonSchema(paramMap)
 }
 
 func mapResponsesInputToMessages(input json.RawMessage) ([]dto.Message, error) {
