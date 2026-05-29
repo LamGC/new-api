@@ -270,9 +270,24 @@ func RequestOpenAI2ClaudeMessage(c *gin.Context, textRequest dto.GeneralOpenAIRe
 		if message.Role == "assistant" && message.ToolCalls != nil {
 			fmtMessage.ToolCalls = message.ToolCalls
 		}
+		if message.Role == "assistant" && message.ReasoningContent != nil {
+			fmtMessage.ReasoningContent = message.ReasoningContent
+		}
+		if message.Reasoning != nil {
+			fmtMessage.Reasoning = message.Reasoning
+		}
 		if lastMessage.Role == message.Role && lastMessage.Role != "tool" {
 			if lastMessage.IsStringContent() && message.IsStringContent() {
-				fmtMessage.SetStringContent(strings.Trim(fmt.Sprintf("%s %s", lastMessage.StringContent(), message.StringContent()), "\""))
+				mergedText := strings.Trim(fmt.Sprintf("%s %s", lastMessage.StringContent(), message.StringContent()), "\"")
+				fmtMessage.SetStringContent(mergedText)
+				if lastMessage.ReasoningContent != nil && message.ReasoningContent != nil {
+					mergedReasoning := *lastMessage.ReasoningContent + "\n" + *message.ReasoningContent
+					fmtMessage.ReasoningContent = &mergedReasoning
+				} else if message.ReasoningContent != nil {
+					fmtMessage.ReasoningContent = message.ReasoningContent
+				} else if lastMessage.ReasoningContent != nil {
+					fmtMessage.ReasoningContent = lastMessage.ReasoningContent
+				}
 				// delete last message
 				formatMessages = formatMessages[:len(formatMessages)-1]
 			}
@@ -359,15 +374,34 @@ func RequestOpenAI2ClaudeMessage(c *gin.Context, textRequest dto.GeneralOpenAIRe
 						},
 					}
 				}
-			} else if message.IsStringContent() && message.ToolCalls == nil {
-				text := message.StringContent()
-				if text == "" {
-					text = "..."
+		} else if message.IsStringContent() && message.ToolCalls == nil {
+			text := message.StringContent()
+			if text == "" {
+				text = "..."
+			}
+			if message.Role == "assistant" && message.GetReasoningContent() != "" {
+				claudeMessage.Content = []dto.ClaudeMediaMessage{
+					{
+						Type:     "thinking",
+						Thinking: common.GetPointer[string](message.GetReasoningContent()),
+					},
+					{
+						Type: "text",
+						Text: common.GetPointer[string](text),
+					},
 				}
-				claudeMessage.Content = text
 			} else {
-				claudeMediaMessages := make([]dto.ClaudeMediaMessage, 0)
-				for _, mediaMessage := range message.ParseContent() {
+				claudeMessage.Content = text
+			}
+		} else {
+			claudeMediaMessages := make([]dto.ClaudeMediaMessage, 0)
+			if message.Role == "assistant" && message.GetReasoningContent() != "" {
+				claudeMediaMessages = append(claudeMediaMessages, dto.ClaudeMediaMessage{
+					Type:     "thinking",
+					Thinking: common.GetPointer[string](message.GetReasoningContent()),
+				})
+			}
+			for _, mediaMessage := range message.ParseContent() {
 					switch mediaMessage.Type {
 					case "text":
 						if mediaMessage.Text != "" {

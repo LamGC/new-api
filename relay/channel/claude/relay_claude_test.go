@@ -2,6 +2,7 @@ package claude
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -379,4 +380,110 @@ func TestRequestOpenAI2ClaudeMessage_ConvertsTextFileContentToText(t *testing.T)
 	require.Equal(t, "text", content[0].Type)
 	require.NotNil(t, content[0].Text)
 	require.Equal(t, "alpha\nbeta", *content[0].Text)
+}
+
+func mustMarshal[T any](t *testing.T, v T) []byte {
+	data, err := json.Marshal(v)
+	require.NoError(t, err)
+	return data
+}
+
+func strPtr(s string) *string { return &s }
+
+func TestRequestOpenAI2ClaudeMessage_PreservesReasoningContentAsThinking(t *testing.T) {
+	reasoningText := "Let me think about this step by step."
+	request := dto.GeneralOpenAIRequest{
+		Model: "claude-sonnet-4-5-20250929",
+		Messages: []dto.Message{
+			{Role: "user", Content: "Hello"},
+			{
+				Role:             "assistant",
+				Content:          "The answer is 42.",
+				ReasoningContent: strPtr(reasoningText),
+			},
+		},
+	}
+
+	result, err := RequestOpenAI2ClaudeMessage(nil, request)
+	require.NoError(t, err)
+	require.Len(t, result.Messages, 2)
+
+	assistantMsg := result.Messages[1]
+	require.Equal(t, "assistant", assistantMsg.Role)
+
+	content, ok := assistantMsg.Content.([]dto.ClaudeMediaMessage)
+	require.True(t, ok, "expected array content with thinking block")
+	require.Len(t, content, 2, "expected thinking + text blocks")
+
+	require.Equal(t, "thinking", content[0].Type)
+	require.NotNil(t, content[0].Thinking)
+	require.Equal(t, reasoningText, *content[0].Thinking)
+
+	require.Equal(t, "text", content[1].Type)
+	require.NotNil(t, content[1].Text)
+	require.Equal(t, "The answer is 42.", *content[1].Text)
+}
+
+func TestRequestOpenAI2ClaudeMessage_ReasoningContentWithToolCalls(t *testing.T) {
+	reasoningText := "I need to call a tool."
+	request := dto.GeneralOpenAIRequest{
+		Model: "claude-sonnet-4-5-20250929",
+		Messages: []dto.Message{
+			{Role: "user", Content: "Hello"},
+			{
+				Role:             "assistant",
+				Content:          "Let me check.",
+				ReasoningContent: strPtr(reasoningText),
+				ToolCalls: mustMarshal(t, []dto.ToolCallRequest{
+					{
+						ID:   "call_1",
+						Type: "function",
+						Function: dto.FunctionRequest{
+							Name:      "get_weather",
+							Arguments: `{"city":"Tokyo"}`,
+						},
+					},
+				}),
+			},
+		},
+	}
+
+	result, err := RequestOpenAI2ClaudeMessage(nil, request)
+	require.NoError(t, err)
+	require.Len(t, result.Messages, 2)
+
+	assistantMsg := result.Messages[1]
+	content, ok := assistantMsg.Content.([]dto.ClaudeMediaMessage)
+	require.True(t, ok)
+
+	// Should have thinking block + tool_use block
+	require.True(t, len(content) >= 2)
+
+	foundThinking := false
+	for _, block := range content {
+		if block.Type == "thinking" {
+			foundThinking = true
+			require.NotNil(t, block.Thinking)
+			require.Equal(t, reasoningText, *block.Thinking)
+		}
+	}
+	require.True(t, foundThinking, "thinking block should be present")
+}
+
+func TestRequestOpenAI2ClaudeMessage_NoReasoningContentNoThinkingBlock(t *testing.T) {
+	request := dto.GeneralOpenAIRequest{
+		Model: "claude-sonnet-4-5-20250929",
+		Messages: []dto.Message{
+			{Role: "user", Content: "Hello"},
+			{Role: "assistant", Content: "No thinking here."},
+		},
+	}
+
+	result, err := RequestOpenAI2ClaudeMessage(nil, request)
+	require.NoError(t, err)
+
+	assistantMsg := result.Messages[1]
+	// Non-assistant / no reasoning: should stay as string content
+	require.True(t, assistantMsg.IsStringContent())
+	require.Equal(t, "No thinking here.", assistantMsg.GetStringContent())
 }
