@@ -12,14 +12,22 @@ import (
 )
 
 type ChannelSettings struct {
-	TaskPluginKey             string `json:"task_plugin_key,omitempty"`
-	ForceFormat               bool   `json:"force_format,omitempty"`
-	ThinkingToContent         bool   `json:"thinking_to_content,omitempty"`
-	Proxy                     string `json:"proxy"`
-	PassThroughBodyEnabled    bool   `json:"pass_through_body_enabled,omitempty"`
-	ResponsesWebSocketEnabled bool   `json:"responses_websocket_enabled,omitempty"`
-	SystemPrompt              string `json:"system_prompt,omitempty"`
-	SystemPromptOverride      bool   `json:"system_prompt_override,omitempty"`
+	// ResponsesViaChat opts this channel into Responses-to-Chat conversion.
+	ResponsesViaChat bool `json:"responses_via_chat,omitempty"`
+	// ResponsesLocalReplay explicitly enables bounded local response history.
+	ResponsesLocalReplay bool `json:"responses_local_replay,omitempty"`
+	// PreserveHistoryThinking retains historical reasoning across supported conversions.
+	PreserveHistoryThinking bool `json:"preserve_history_thinking,omitempty"`
+	// ResponsesChatCompatibility selects an optional compatibility profile.
+	ResponsesChatCompatibility string `json:"responses_chat_compatibility,omitempty"`
+	TaskPluginKey              string `json:"task_plugin_key,omitempty"`
+	ForceFormat                bool   `json:"force_format,omitempty"`
+	ThinkingToContent          bool   `json:"thinking_to_content,omitempty"`
+	Proxy                      string `json:"proxy"`
+	PassThroughBodyEnabled     bool   `json:"pass_through_body_enabled,omitempty"`
+	ResponsesWebSocketEnabled  bool   `json:"responses_websocket_enabled,omitempty"`
+	SystemPrompt               string `json:"system_prompt,omitempty"`
+	SystemPromptOverride       bool   `json:"system_prompt_override,omitempty"`
 	// TaskExtendPluginKeys lists the task plugins a New API channel (type 60)
 	// is extended with. The upstream gateway may host many plugins, so the
 	// channel serves every listed plugin's models while the request still pins
@@ -35,6 +43,29 @@ type ChannelSettings struct {
 	// TLSInsecureSkipVerify accepts upstream certificates that fail
 	// verification, such as self-signed ones, for this channel only.
 	TLSInsecureSkipVerify bool `json:"tls_insecure_skip_verify,omitempty"`
+}
+
+// ValidateResponsesViaChat rejects contradictory and unknown bridge settings.
+func (s ChannelSettings) ValidateResponsesViaChat(supported bool) error {
+	if s.ResponsesChatCompatibility != "" && s.ResponsesChatCompatibility != "legacy" {
+		return fmt.Errorf("responses_chat_compatibility must be empty or legacy")
+	}
+	if !s.ResponsesViaChat {
+		if s.ResponsesChatCompatibility != "" || s.ResponsesLocalReplay {
+			return fmt.Errorf("responses_chat_compatibility and responses_local_replay require responses_via_chat")
+		}
+		return nil
+	}
+	if !supported {
+		return fmt.Errorf("responses_via_chat is unsupported for this channel type")
+	}
+	if s.ResponsesWebSocketEnabled {
+		return fmt.Errorf("responses_via_chat cannot be combined with responses_websocket_enabled")
+	}
+	if s.PassThroughBodyEnabled {
+		return fmt.Errorf("responses_via_chat cannot be combined with pass_through_body_enabled")
+	}
+	return nil
 }
 
 // BindsTaskPlugin reports whether the channel is bound to the task plugin,

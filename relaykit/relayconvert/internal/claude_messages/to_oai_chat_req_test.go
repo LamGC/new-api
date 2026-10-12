@@ -2,6 +2,7 @@ package claudemessages
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -148,4 +149,38 @@ func TestClaudeMessagesRequestToOpenAIChatKeepsParallelToolResultsContiguous(t *
 	assert.Equal(t, dto.ContentTypeImageURL, parts[0].Type)
 	require.NotNil(t, parts[0].GetImageMedia())
 	assert.Equal(t, dataURL, parts[0].GetImageMedia().Url)
+}
+
+func TestClaudeMessagesHistoryThinkingOptIn(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("enabled=%v", enabled), func(t *testing.T) {
+			meta := &convmeta.Values{Options: &convmeta.Options{PreserveHistoryThinking: enabled}}
+			req := dto.ClaudeRequest{Model: "test-model", Messages: []dto.ClaudeMessage{
+				{Role: "user", Content: "question"},
+				{Role: "assistant", Content: []dto.ClaudeMediaMessage{
+					{Type: "thinking", Thinking: lo.ToPtr("first")},
+					{Type: "thinking", Thinking: lo.ToPtr("second"), Signature: "opaque"},
+				}},
+				{Role: "user", Content: "continue"},
+				{Role: "assistant", Content: []dto.ClaudeMediaMessage{
+					{Type: "thinking", Thinking: lo.ToPtr("tool reasoning")},
+					{Type: "tool_use", Id: "call_1", Name: "search", Input: map[string]any{"q": "test"}},
+				}},
+			}}
+			got, err := ClaudeMessagesRequestToOpenAIChat(context.Background(), req, meta)
+			require.NoError(t, err)
+			if enabled {
+				require.Len(t, got.Messages, 4)
+				assert.Equal(t, "first\nsecond", got.Messages[1].GetReasoningContent())
+				assert.Equal(t, "tool reasoning", got.Messages[3].GetReasoningContent())
+				require.Len(t, got.Messages[3].ParseToolCalls(), 1)
+				assert.Equal(t, "call_1", got.Messages[3].ParseToolCalls()[0].ID)
+			} else {
+				require.Len(t, got.Messages, 3)
+				for _, msg := range got.Messages {
+					assert.Empty(t, msg.GetReasoningContent())
+				}
+			}
+		})
+	}
 }

@@ -7,6 +7,11 @@ import "github.com/QuantumNous/new-api/relaykit/types"
 // Meta (see relaycommon.RelayInfo.ConvOptions); relaykit users fill it
 // directly. Zero value = every adaptation disabled, no defaults applied.
 type Options struct {
+	// ResponsesChatCompatibility selects an explicitly enabled provider profile.
+	// Empty preserves the official converter; "legacy" adapts older Chat APIs.
+	ResponsesChatCompatibility string
+	PreserveHistoryThinking    bool
+
 	Claude ClaudeOptions
 	Gemini GeminiOptions
 

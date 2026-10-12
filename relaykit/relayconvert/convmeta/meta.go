@@ -93,7 +93,15 @@ type ClaudeStreamToolCall struct {
 
 // ResponsesToolState records how Responses-only tool definitions were encoded
 // for the upstream protocol, so the matching response can be restored.
+type ResponsesToolIdentity struct {
+	Namespace string
+	Name      string
+}
+
 type ResponsesToolState struct {
+	// OriginalNames reverses request-scoped aliases without parsing delimiters.
+	OriginalNames map[string]ResponsesToolIdentity
+
 	// CustomToolNames lists Responses custom (freeform) tools that were sent
 	// upstream as function tools taking one string "input" argument. Function
 	// calls with these names are custom tool calls.
@@ -137,6 +145,9 @@ func (s *ResponsesToolState) IsCustomTool(name string) bool {
 func (s *ResponsesToolState) ResponsesToolName(upstreamName string) (string, string) {
 	if s == nil {
 		return "", upstreamName
+	}
+	if original, ok := s.OriginalNames[upstreamName]; ok {
+		return original.Namespace, original.Name
 	}
 	namespace, ok := s.Namespaces[upstreamName]
 	if !ok {

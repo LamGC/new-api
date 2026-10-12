@@ -181,6 +181,22 @@ func ClaudeMessagesRequestToOpenAIChat(ctx context.Context, claudeRequest dto.Cl
 					toolNames[mediaMsg.Id] = mediaMsg.Name
 				}
 				switch mediaMsg.Type {
+				case "thinking":
+					if convmeta.OptionsOf(info).PreserveHistoryThinking && claudeMessage.Role == "assistant" && mediaMsg.Thinking != nil {
+						thinking := openAIMessage.GetReasoningContent()
+						if thinking != "" && *mediaMsg.Thinking != "" {
+							thinking += "\n"
+						}
+						thinking += *mediaMsg.Thinking
+						openAIMessage.ReasoningContent = kitutil.GetPointer(thinking)
+						if mediaMsg.Signature != "" {
+							convdiag.Add(ctx, types.ConversionDiagnostic{Code: "history_thinking_signature_omitted", Path: fmt.Sprintf("messages[%d].content[%d]", messageIndex, blockIndex), Message: "Chat reasoning_content preserves thinking text but cannot carry the Claude signature", Severity: types.ConversionDiagnosticWarning})
+						}
+					}
+				case "redacted_thinking":
+					if convmeta.OptionsOf(info).PreserveHistoryThinking {
+						convdiag.Add(ctx, types.ConversionDiagnostic{Code: "redacted_history_thinking_omitted", Path: fmt.Sprintf("messages[%d].content[%d]", messageIndex, blockIndex), Message: "Chat reasoning_content cannot represent redacted Claude thinking", Severity: types.ConversionDiagnosticError})
+					}
 				case "text", "input_text":
 					message := dto.MediaContent{
 						Type:         "text",
@@ -274,7 +290,7 @@ func ClaudeMessagesRequestToOpenAIChat(ctx context.Context, claudeRequest dto.Cl
 				openAIMessage.SetMediaContent(mediaMessages)
 			}
 		}
-		if len(openAIMessage.ParseContent()) > 0 || len(openAIMessage.ToolCalls) > 0 {
+		if len(openAIMessage.ParseContent()) > 0 || len(openAIMessage.ToolCalls) > 0 || openAIMessage.GetReasoningContent() != "" {
 			openAIMessages = append(openAIMessages, openAIMessage)
 		}
 	}

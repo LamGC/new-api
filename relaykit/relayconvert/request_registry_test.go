@@ -1,6 +1,9 @@
 package relayconvert
 
 import (
+	"fmt"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -924,4 +927,227 @@ func mustMarshalRequestJSON(t *testing.T, value any) []byte {
 	raw, err := kitutil.Marshal(value)
 	require.NoError(t, err)
 	return raw
+}
+
+func TestLegacyResponsesCompatibilityRoundTrip(t *testing.T) {
+	req := &dto.OpenAIResponsesRequest{Model: "legacy", MaxOutputTokens: lo.ToPtr(uint(0)),
+		Tools: []byte(`[
+   {"type":"custom","custom":{"type":"namespace","name":"a","tools":[{"type":"function","name":"b","strict":true,"parameters":{"type":"object","$defs":{"V":{"type":"integer","minimum":1}},"properties":{"x":{"$ref":"#/$defs/V"}},"required":["x"],"additionalProperties":false}}]}},
+   {"type":"function","name":"a__b","parameters":{"type":"object"}},
+   {"type":"namespace","name":"odd.name","tools":[{"type":"custom","name":"run space","format":{"type":"text"}}]}
+  ]`),
+		ToolChoice: []byte(`{"type":"function","namespace":"a","name":"b"}`),
+		Input:      []byte(`[{"role":"developer","content":"rules"},{"type":"function_call","namespace":"a","name":"b","call_id":"keep_call","arguments":"{\"x\":1}"},{"type":"function_call_output","call_id":"keep_call","output":"ok"}]`),
+	}
+	original := append([]byte(nil), req.Tools...)
+	info := &convmeta.Values{Options: &convmeta.Options{ResponsesChatCompatibility: "legacy"}}
+	result, err := ConvertRequest(nil, info, types.RelayFormatOpenAI, req)
+	require.NoError(t, err)
+	chat := result.Value.(*dto.GeneralOpenAIRequest)
+	require.Len(t, chat.Tools, 3)
+	assert.Equal(t, "system", chat.Messages[0].Role)
+	require.NotNil(t, chat.MaxTokens)
+	assert.Zero(t, *chat.MaxTokens)
+	assert.Nil(t, chat.MaxCompletionTokens)
+	assert.Equal(t, original, []byte(req.Tools))
+	assert.Nil(t, chat.Tools[0].Function.Strict)
+	names := map[string]bool{}
+	for _, tool := range chat.Tools {
+		assert.Regexp(t, `^[A-Za-z0-9_-]{1,64}$`, tool.Function.Name)
+		assert.False(t, names[tool.Function.Name])
+		names[tool.Function.Name] = true
+	}
+	alias := chat.Tools[0].Function.Name
+	choice := chat.ToolChoice.(map[string]any)
+	assert.Equal(t, alias, choice["function"].(map[string]any)["name"])
+	calls := chat.Messages[1].ParseToolCalls()
+	require.Len(t, calls, 1)
+	assert.Equal(t, alias, calls[0].Function.Name)
+	assert.Equal(t, "keep_call", calls[0].ID)
+	assert.Equal(t, "keep_call", chat.Messages[2].ToolCallId)
+	schema := chat.Tools[0].Function.Parameters.(map[string]any)
+	assert.Contains(t, schema, "$defs")
+	assert.Equal(t, "#/$defs/V", schema["properties"].(map[string]any)["x"].(map[string]any)["$ref"])
+	assert.Equal(t, false, schema["additionalProperties"])
+	for i, tool := range chat.Tools {
+		args := `{"x":1}`
+		if i == 2 {
+			args = `{"input":"print(1)"}`
+		}
+		call := dto.ToolCallRequest{ID: "keep_call", Type: "function", Function: dto.FunctionRequest{Name: tool.Function.Name, Arguments: args}}
+		message := dto.Message{Role: "assistant", ToolCalls: mustMarshalRequestJSON(t, []dto.ToolCallRequest{call})}
+		converted, err := ConvertResponse(nil, info, types.RelayFormatOpenAIResponses, &dto.OpenAITextResponse{Choices: []dto.OpenAITextResponseChoice{{Message: message, FinishReason: "tool_calls"}}})
+		require.NoError(t, err)
+		output := converted.Value.(*dto.OpenAIResponsesResponse).Output
+		require.Len(t, output, 1)
+		namespace, name := info.ResponsesTools.ResponsesToolName(tool.Function.Name)
+		assert.Equal(t, name, output[0].Name)
+		assert.Equal(t, namespace, output[0].Namespace)
+		assert.Equal(t, "keep_call", output[0].CallId)
+		if i == 2 {
+			assert.Equal(t, "custom_tool_call", output[0].Type)
+			assert.JSONEq(t, `"print(1)"`, string(output[0].Input))
+		}
+		stream, err := NewResponseStreamState(types.RelayFormatOpenAI, types.RelayFormatOpenAIResponses, ResponseStreamOptions{ID: "resp_test", Model: "legacy"})
+		require.NoError(t, err)
+		events, err := ConvertStreamResponseChunk(nil, info, stream, &dto.ChatCompletionsStreamResponse{Choices: []dto.ChatCompletionsStreamResponseChoice{{Delta: dto.ChatCompletionsStreamResponseChoiceDelta{ToolCalls: []dto.ToolCallResponse{{Index: lo.ToPtr(0), ID: "keep_call", Type: "function", Function: dto.FunctionResponse{Name: tool.Function.Name, Arguments: args}}}}}}})
+		require.NoError(t, err)
+		done, err := FinalizeStreamResponse(nil, info, stream)
+		require.NoError(t, err)
+		events = append(events, done...)
+		added, completed := false, false
+		for _, event := range events {
+			payload := event.Value.(ChatToResponsesStreamEvent)
+			if payload.Type == "response.output_item.added" {
+				added = true
+				assert.Equal(t, name, payload.Payload.Item.Name)
+				assert.Equal(t, namespace, payload.Payload.Item.Namespace)
+				assert.Equal(t, "keep_call", payload.Payload.Item.CallId)
+			}
+			if payload.Type == "response.completed" {
+				completed = true
+				assert.Equal(t, name, payload.Payload.Response.Output[0].Name)
+				assert.Equal(t, namespace, payload.Payload.Response.Output[0].Namespace)
+				assert.Equal(t, "keep_call", payload.Payload.Response.Output[0].CallId)
+			}
+		}
+		assert.True(t, added)
+		assert.True(t, completed)
+	}
+	repeated, err := ConvertRequest(nil, info, types.RelayFormatOpenAI, req)
+	require.NoError(t, err)
+	assert.Equal(t, alias, repeated.Value.(*dto.GeneralOpenAIRequest).Tools[0].Function.Name)
+	_, err = ConvertRequest(nil, info, types.RelayFormatOpenAI, &dto.OpenAIResponsesRequest{})
+	require.Error(t, err)
+	assert.Nil(t, info.ResponsesTools)
+}
+
+func TestLegacyResponsesProfileIsOptIn(t *testing.T) {
+	req := &dto.OpenAIResponsesRequest{Model: "test", MaxOutputTokens: lo.ToPtr(uint(42)), Input: []byte(`[{"role":"developer","content":"rules"}]`), Tools: []byte(`[{"type":"function","name":"run","strict":true,"parameters":{"type":"object","anyOf":[{"required":["x"]},{"required":["y"]}]}}]`), ToolChoice: []byte(`"required"`)}
+	official, err := ConvertRequest(nil, &convmeta.Values{}, types.RelayFormatOpenAI, req)
+	require.NoError(t, err)
+	chat := official.Value.(*dto.GeneralOpenAIRequest)
+	assert.Equal(t, "developer", chat.Messages[0].Role)
+	assert.Equal(t, "required", chat.ToolChoice)
+	assert.Nil(t, chat.MaxTokens)
+	assert.Equal(t, uint(42), *chat.MaxCompletionTokens)
+	require.NotNil(t, chat.Tools[0].Function.Strict)
+	legacy := &convmeta.Values{Options: &convmeta.Options{ResponsesChatCompatibility: "legacy"}}
+	adapted, err := ConvertRequest(nil, legacy, types.RelayFormatOpenAI, req)
+	require.NoError(t, err)
+	chat = adapted.Value.(*dto.GeneralOpenAIRequest)
+	assert.Equal(t, "auto", chat.ToolChoice)
+	assert.Contains(t, chat.Tools[0].Function.Parameters, "anyOf")
+	require.NotEmpty(t, adapted.Diagnostics)
+	legacy.Options.ToolLossPolicy = types.ConversionLossPolicyStrict
+	_, err = ConvertRequest(nil, legacy, types.RelayFormatOpenAI, req)
+	require.Error(t, err)
+	assert.Nil(t, legacy.ResponsesTools)
+}
+
+func TestLegacyResponsesAliasDeterminismAndAmbiguity(t *testing.T) {
+	longName := strings.Repeat("long", 25)
+	tools := []map[string]any{
+		{"type": "function", "name": "same"},
+		{"type": "custom", "name": "same", "format": map[string]any{"type": "text"}},
+		{"type": "namespace", "name": "a.b", "tools": []any{map[string]any{"type": "function", "name": longName}}},
+	}
+	req := &dto.OpenAIResponsesRequest{Model: "legacy", Tools: mustMarshalRequestJSON(t, tools), ToolChoice: []byte(`{"type":"custom","name":"same"}`), Input: []byte(`[{"type":"custom_tool_call","name":"same","call_id":"custom_id","input":"echo hi"},{"type":"custom_tool_call_output","call_id":"custom_id","output":"ok"}]`), Text: []byte(`{"format":{"type":"json_schema","name":"output","strict":true,"schema":{"$id":"https://example.com/schema","$defs":{"value":{"type":"string"}},"$ref":"#/$defs/value"}}}`)}
+	info := &convmeta.Values{Options: &convmeta.Options{ResponsesChatCompatibility: "legacy"}}
+	converted, err := ConvertRequest(nil, info, types.RelayFormatOpenAI, req)
+	require.NoError(t, err)
+	chat := converted.Value.(*dto.GeneralOpenAIRequest)
+	assert.Equal(t, "auto", chat.ToolChoice)
+	assert.Equal(t, chat.Tools[1].Function.Name, chat.Messages[0].ParseToolCalls()[0].Function.Name)
+	assert.Equal(t, "custom_id", chat.Messages[0].ParseToolCalls()[0].ID)
+	original := info.ResponsesTools.OriginalNames
+	var format map[string]any
+	require.NoError(t, kitutil.Unmarshal(chat.ResponseFormat.JsonSchema, &format))
+	assert.NotContains(t, format, "strict")
+	assert.Contains(t, format["schema"], "$id")
+	assert.Contains(t, format["schema"], "$defs")
+	slices.Reverse(tools)
+	req.Tools = mustMarshalRequestJSON(t, tools)
+	_, err = ConvertRequest(nil, info, types.RelayFormatOpenAI, req)
+	require.NoError(t, err)
+	assert.Equal(t, original, info.ResponsesTools.OriginalNames)
+	req.Tools = []byte(`[{"type":"namespace","name":"a","tools":[{"type":"function","name":"run"}]},{"type":"namespace","name":"b","tools":[{"type":"function","name":"run"}]}]`)
+	req.Input = []byte(`[{"type":"function_call","name":"run","call_id":"c","arguments":"{}"}]`)
+	_, err = ConvertRequest(nil, info, types.RelayFormatOpenAI, req)
+	require.ErrorContains(t, err, "ambiguous")
+	assert.Nil(t, info.ResponsesTools)
+	info.ResponsesTools = &convmeta.ResponsesToolState{OriginalNames: original}
+	_, err = ConvertRequest(nil, info, types.RelayFormatOpenAIResponses, req)
+	require.NoError(t, err)
+	assert.Nil(t, info.ResponsesTools)
+}
+
+func TestLegacyResponsesPreservesProviderExtensions(t *testing.T) {
+	request := &dto.OpenAIResponsesRequest{Model: "legacy", Input: []byte(`"hello"`), ChatTemplateKwargs: []byte(`{"enable_thinking":false,"custom":0}`), TopK: []byte(`0`), MinP: []byte(`0`), RepetitionPenalty: []byte(`1.1`), Stop: []byte(`["stop",""]`), CacheSalt: []byte(`""`)}
+	info := &convmeta.Values{Options: &convmeta.Options{ResponsesChatCompatibility: "legacy"}}
+	result, err := ConvertRequest(nil, info, types.RelayFormatOpenAI, request)
+	require.NoError(t, err)
+	chat := result.Value.(*dto.GeneralOpenAIRequest)
+	require.NotNil(t, chat.TopK)
+	assert.Zero(t, *chat.TopK)
+	raw := mustMarshalRequestJSON(t, chat)
+	var encoded map[string]any
+	require.NoError(t, kitutil.Unmarshal(raw, &encoded))
+	assert.Equal(t, map[string]any{"enable_thinking": false, "custom": float64(0)}, encoded["chat_template_kwargs"])
+	assert.Equal(t, float64(0), encoded["top_k"])
+	assert.Equal(t, float64(0), encoded["min_p"])
+	assert.Equal(t, 1.1, encoded["repetition_penalty"])
+	assert.Equal(t, []any{"stop", ""}, encoded["stop"])
+	assert.Equal(t, "", encoded["cache_salt"])
+	ordinary, err := ConvertRequest(nil, nil, types.RelayFormatOpenAI, request)
+	require.NoError(t, err)
+	chat = ordinary.Value.(*dto.GeneralOpenAIRequest)
+	assert.Nil(t, chat.ChatTemplateKwargs)
+	assert.Nil(t, chat.TopK)
+	assert.Nil(t, chat.MinP)
+	assert.Nil(t, chat.RepetitionPenalty)
+	assert.Nil(t, chat.Stop)
+	assert.Nil(t, chat.CacheSalt)
+	for _, invalid := range []string{`1.5`, `"5"`, `999999999999999999999999999999`} {
+		request.TopK = []byte(invalid)
+		_, err = ConvertRequest(nil, info, types.RelayFormatOpenAI, request)
+		require.ErrorContains(t, err, "invalid top_k")
+		assert.Nil(t, info.ResponsesTools)
+	}
+	request.TopK = []byte(`null`)
+	request.Stop = []byte(`null`)
+	result, err = ConvertRequest(nil, info, types.RelayFormatOpenAI, request)
+	require.NoError(t, err)
+	assert.Nil(t, result.Value.(*dto.GeneralOpenAIRequest).TopK)
+	raw = mustMarshalRequestJSON(t, result.Value)
+	require.NoError(t, kitutil.Unmarshal(raw, &encoded))
+	assert.Contains(t, encoded, "stop")
+	assert.Nil(t, encoded["stop"])
+}
+
+func TestLegacyResponsesStrictLossTracksActualGuarantees(t *testing.T) {
+	for _, policy := range []types.ConversionLossPolicy{types.ConversionLossPolicySafe, types.ConversionLossPolicyStrict} {
+		for _, strict := range []any{nil, false, true, "invalid"} {
+			t.Run(fmt.Sprintf("%s/%v", policy, strict), func(t *testing.T) {
+				schema := map[string]any{"type": "object", "$defs": map[string]any{"value": map[string]any{"type": "integer", "minimum": 1}}, "properties": map[string]any{"x": map[string]any{"$ref": "#/$defs/value"}}, "additionalProperties": false}
+				for _, output := range []bool{false, true} {
+					request := &dto.OpenAIResponsesRequest{Model: "legacy", Input: []byte(`"hello"`)}
+					if output {
+						request.Text = mustMarshalRequestJSON(t, map[string]any{"format": map[string]any{"type": "json_schema", "name": "output", "strict": strict, "schema": schema}})
+					} else {
+						request.Tools = mustMarshalRequestJSON(t, []any{map[string]any{"type": "function", "name": "run", "strict": strict, "parameters": schema}})
+					}
+					info := &convmeta.Values{Options: &convmeta.Options{ResponsesChatCompatibility: "legacy", ToolLossPolicy: policy}}
+					result, err := ConvertRequest(nil, info, types.RelayFormatOpenAI, request)
+					if strict == true || strict == "invalid" {
+						require.Error(t, err)
+						assert.Nil(t, info.ResponsesTools)
+					} else {
+						require.NoError(t, err)
+						assert.Empty(t, result.Diagnostics)
+					}
+				}
+			})
+		}
+	}
 }

@@ -16,6 +16,7 @@ import (
 	oaichat "github.com/QuantumNous/new-api/relaykit/relayconvert/internal/oai_chat"
 	oairesponses "github.com/QuantumNous/new-api/relaykit/relayconvert/internal/oai_responses"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/internal/toolconv"
+	"github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
 	"github.com/QuantumNous/new-api/relaykit/types"
 )
 
@@ -155,6 +156,9 @@ func LookupRequestConverter(converter string) (RequestConverterSpec, bool) {
 }
 
 func ConvertRequest(c context.Context, info convmeta.Meta, target types.RelayFormat, request any) (*RequestResult, error) {
+	if info != nil {
+		info.SetResponsesToolState(nil)
+	}
 	from, err := inferRequestRelayFormat(request)
 	if err != nil {
 		return nil, err
@@ -178,6 +182,9 @@ func ConvertRequest(c context.Context, info convmeta.Meta, target types.RelayFor
 }
 
 func ConvertRequestVia(c context.Context, info convmeta.Meta, request any, path ...types.RelayFormat) (*RequestResult, error) {
+	if info != nil {
+		info.SetResponsesToolState(nil)
+	}
 	from, err := inferRequestRelayFormat(request)
 	if err != nil {
 		return nil, err
@@ -218,6 +225,9 @@ func ConvertRequestVia(c context.Context, info convmeta.Meta, request any, path 
 }
 
 func ConvertRequestByID(c context.Context, info convmeta.Meta, converter string, request any) (*RequestResult, error) {
+	if info != nil {
+		info.SetResponsesToolState(nil)
+	}
 	from, err := inferRequestRelayFormat(request)
 	if err != nil {
 		return nil, err
@@ -243,6 +253,20 @@ func executeRequestSpec(c context.Context, info convmeta.Meta, from types.RelayF
 
 func executeRequestSteps(c context.Context, info convmeta.Meta, from types.RelayFormat, target types.RelayFormat, request any, converter string, quality RequestConverterQuality, specs []RequestConverterSpec) (*RequestResult, error) {
 	c, diagnosticCollector := convdiag.WithCollector(c)
+	// Clear before preparation as failures and retries must not retain aliases.
+	if info != nil {
+		info.SetResponsesToolState(nil)
+	}
+	var legacyState *convmeta.ResponsesToolState
+	legacy := from == types.RelayFormatOpenAIResponses && target == types.RelayFormatOpenAI && convmeta.OptionsOf(info).ResponsesChatCompatibility == "legacy"
+	if legacy {
+		prepared, state, diagnostics, prepareErr := toolconv.PrepareLegacyResponses(request)
+		if prepareErr != nil {
+			return nil, prepareErr
+		}
+		request, legacyState = prepared, state
+		convdiag.Add(c, diagnostics...)
+	}
 	current, tools, err := toolconv.ExtractRequest(from, request)
 	if err != nil {
 		return nil, err
@@ -259,6 +283,28 @@ func executeRequestSteps(c context.Context, info convmeta.Meta, from types.Relay
 
 	tools.Model = convmeta.UpstreamModelName(info)
 	current, toolDiagnostics, err := toolconv.AttachRequest(target, current, tools, convmeta.OptionsOf(info))
+	if err == nil && legacy {
+		chat := current.(*dto.GeneralOpenAIRequest)
+		responses := request.(*dto.OpenAIResponsesRequest)
+		chat.ChatTemplateKwargs = responses.ChatTemplateKwargs
+		chat.MinP = responses.MinP
+		chat.RepetitionPenalty = responses.RepetitionPenalty
+		chat.CacheSalt = responses.CacheSalt
+		if len(responses.Stop) > 0 {
+			chat.Stop = responses.Stop
+		}
+		if len(responses.TopK) > 0 {
+			if decodeErr := kitutil.Unmarshal(responses.TopK, &chat.TopK); decodeErr != nil {
+				err = fmt.Errorf("invalid top_k for legacy Chat profile: %w", decodeErr)
+			}
+		}
+		chat.MaxTokens, chat.MaxCompletionTokens = chat.MaxCompletionTokens, nil
+		for i := range chat.Messages {
+			if chat.Messages[i].Role == "developer" {
+				chat.Messages[i].Role = "system"
+			}
+		}
+	}
 	diagnostics := append(diagnosticCollector.Diagnostics(), toolDiagnostics...)
 	for i := range diagnostics {
 		if diagnostics[i].From == "" {
@@ -267,6 +313,9 @@ func executeRequestSteps(c context.Context, info convmeta.Meta, from types.Relay
 		if diagnostics[i].To == "" {
 			diagnostics[i].To = target
 		}
+	}
+	if err == nil && legacy {
+		err = types.RejectConversionLoss(convmeta.OptionsOf(info).EffectiveToolLossPolicy(), diagnostics)
 	}
 	if err != nil {
 		return &RequestResult{
@@ -283,7 +332,11 @@ func executeRequestSteps(c context.Context, info convmeta.Meta, from types.Relay
 			info.AppendRequestConversion(step.To)
 		}
 		if from == types.RelayFormatOpenAIResponses {
-			info.SetResponsesToolState(responsesToolState(tools))
+			if legacyState != nil {
+				info.SetResponsesToolState(legacyState)
+			} else {
+				info.SetResponsesToolState(responsesToolState(tools))
+			}
 		}
 	}
 

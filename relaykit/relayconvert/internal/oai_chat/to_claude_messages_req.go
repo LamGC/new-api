@@ -151,6 +151,10 @@ func OpenAIChatRequestToClaudeMessages(c context.Context, info convmeta.Meta, te
 			Role:    message.Role,
 			Content: message.Content,
 		}
+		if opts.PreserveHistoryThinking && message.Role == "assistant" {
+			fmtMessage.ReasoningContent = message.ReasoningContent
+			fmtMessage.Reasoning = message.Reasoning
+		}
 		if message.Role == "tool" {
 			fmtMessage.ToolCallId = message.ToolCallId
 		}
@@ -160,6 +164,21 @@ func OpenAIChatRequestToClaudeMessages(c context.Context, info convmeta.Meta, te
 		if lastMessage.Role == message.Role && lastMessage.Role != "tool" {
 			if lastMessage.IsStringContent() && message.IsStringContent() {
 				fmtMessage.SetStringContent(fmt.Sprintf("%s %s", lastMessage.StringContent(), message.StringContent()))
+				if opts.PreserveHistoryThinking && message.Role == "assistant" {
+					thinking := lastMessage.GetReasoningContent()
+					if thinking != "" && message.GetReasoningContent() != "" {
+						thinking += "\n"
+					}
+					thinking += message.GetReasoningContent()
+					if thinking != "" {
+						fmtMessage.ReasoningContent = kitutil.GetPointer(thinking)
+						fmtMessage.Reasoning = nil
+					}
+					calls := append(lastMessage.ParseToolCalls(), message.ParseToolCalls()...)
+					if len(calls) > 0 {
+						fmtMessage.SetToolCalls(calls)
+					}
+				}
 				formatMessages = formatMessages[:len(formatMessages)-1]
 			}
 		}
@@ -243,7 +262,7 @@ func OpenAIChatRequestToClaudeMessages(c context.Context, info convmeta.Meta, te
 					Content:   message.Content,
 				},
 			}
-		} else if message.IsStringContent() && message.ToolCalls == nil {
+		} else if message.IsStringContent() && message.ToolCalls == nil && (!opts.PreserveHistoryThinking || message.Role != "assistant" || message.GetReasoningContent() == "") {
 			text := message.StringContent()
 			if text == "" {
 				text = "..."
@@ -251,6 +270,10 @@ func OpenAIChatRequestToClaudeMessages(c context.Context, info convmeta.Meta, te
 			claudeMessage.Content = text
 		} else {
 			claudeMediaMessages := make([]dto.ClaudeMediaMessage, 0)
+			if opts.PreserveHistoryThinking && message.Role == "assistant" && message.GetReasoningContent() != "" {
+				claudeMediaMessages = append(claudeMediaMessages, dto.ClaudeMediaMessage{Type: "thinking", Thinking: kitutil.GetPointer(message.GetReasoningContent())})
+				convdiag.Add(c, types.ConversionDiagnostic{Code: "unsigned_history_thinking", Path: "messages.content", Message: "Chat reasoning_content has no Claude signature; enable history thinking only for upstreams accepting unsigned thinking", Severity: types.ConversionDiagnosticWarning})
+			}
 			for _, mediaMessage := range message.ParseContent() {
 				switch mediaMessage.Type {
 				case "text":
