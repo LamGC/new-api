@@ -19,6 +19,13 @@ For commercial licensing, please contact support@quantumnous.com
 // Static translation keys that don't get picked up by the t('...') regex.
 // These cover dynamic labels (e.g. constants, configs) that are passed into t at runtime.
 export const STATIC_I18N_KEYS = [
+  'Responses via Chat supports OpenAI, Azure and DeepSeek channels only',
+  'Enable Responses via Chat to use compatibility mode or local replay',
+  'responses_chat_compatibility must be empty or legacy',
+  'responses_chat_compatibility and responses_local_replay require responses_via_chat',
+  'responses_via_chat is unsupported for this channel type',
+  'responses_via_chat cannot be combined with responses_websocket_enabled',
+  'responses_via_chat cannot be combined with pass_through_body_enabled',
   'Task usage metadata is unavailable. Pricing details cannot be displayed.',
   'This expression cannot be expanded into a price table. View the original expression below.',
   'This operation is only supported for vLLM or SGLang channels',

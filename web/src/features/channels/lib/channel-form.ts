@@ -271,6 +271,10 @@ export const channelFormSchema = z
     http2_connection_shards: z.number().int().optional(),
     tls_insecure_skip_verify: z.boolean().optional(),
     pass_through_body_enabled: z.boolean().optional(),
+    responses_via_chat: z.boolean().optional(),
+    responses_chat_compatibility: z.enum(['', 'legacy']).optional(),
+    responses_local_replay: z.boolean().optional(),
+    preserve_history_thinking: z.boolean().optional(),
     responses_websocket_enabled: z.boolean().optional(),
     system_prompt: z.string().optional(),
     system_prompt_override: z.boolean().optional(),
@@ -295,6 +299,32 @@ export const channelFormSchema = z
     upstream_model_update_ignored_models: z.string().optional(),
   })
   .superRefine((data, ctx) => {
+    if (data.responses_via_chat) {
+      if (![1, 3, 43].includes(data.type)) {
+        addRequiredIssue(
+          ctx,
+          'responses_via_chat',
+          'Responses via Chat supports OpenAI, Azure and DeepSeek channels only'
+        )
+      }
+      if (data.pass_through_body_enabled || data.responses_websocket_enabled) {
+        addRequiredIssue(
+          ctx,
+          'responses_via_chat',
+          'Disable Pass Through Body and Responses WebSocket before enabling Responses via Chat'
+        )
+      }
+    } else if (
+      data.responses_chat_compatibility ||
+      data.responses_local_replay
+    ) {
+      addRequiredIssue(
+        ctx,
+        'responses_via_chat',
+        'Enable Responses via Chat to use compatibility mode or local replay'
+      )
+    }
+
     if (
       [
         3,
@@ -463,6 +493,10 @@ export const CHANNEL_FORM_DEFAULT_VALUES: ChannelFormValues = {
   http2_connection_shards: 1,
   tls_insecure_skip_verify: false,
   pass_through_body_enabled: false,
+  responses_via_chat: false,
+  responses_chat_compatibility: '' as '' | 'legacy',
+  responses_local_replay: false,
+  preserve_history_thinking: false,
   responses_websocket_enabled: false,
   system_prompt: '',
   system_prompt_override: false,
@@ -508,6 +542,10 @@ export function transformChannelToFormDefaults(
     http2_connection_shards: 1,
     tls_insecure_skip_verify: false,
     pass_through_body_enabled: false,
+    responses_via_chat: false,
+    responses_chat_compatibility: '' as '' | 'legacy',
+    responses_local_replay: false,
+    preserve_history_thinking: false,
     responses_websocket_enabled: false,
     system_prompt: '',
     system_prompt_override: false,
@@ -530,6 +568,11 @@ export function transformChannelToFormDefaults(
         http2_connection_shards: protocol === HTTP_PROTOCOL_HTTP1 ? 1 : shards,
         tls_insecure_skip_verify: parsed.tls_insecure_skip_verify === true,
         pass_through_body_enabled: parsed.pass_through_body_enabled || false,
+        responses_via_chat: parsed.responses_via_chat === true,
+        responses_chat_compatibility:
+          parsed.responses_chat_compatibility === 'legacy' ? 'legacy' : '',
+        responses_local_replay: parsed.responses_local_replay === true,
+        preserve_history_thinking: parsed.preserve_history_thinking === true,
         responses_websocket_enabled:
           parsed.responses_websocket_enabled === true,
         system_prompt: parsed.system_prompt || '',
@@ -668,6 +711,21 @@ export function buildSettingJSON(formData: ChannelFormValues): string {
       formData.responses_websocket_enabled === true,
     system_prompt: formData.system_prompt || '',
     system_prompt_override: formData.system_prompt_override || false,
+  }
+
+  // Keep the opt-in defaults absent from existing channel configurations.
+  if (formData.responses_via_chat === true) {
+    settingObj.responses_via_chat = true
+  }
+  if (formData.responses_chat_compatibility) {
+    settingObj.responses_chat_compatibility =
+      formData.responses_chat_compatibility
+  }
+  if (formData.responses_local_replay === true) {
+    settingObj.responses_local_replay = true
+  }
+  if (formData.preserve_history_thinking === true) {
+    settingObj.preserve_history_thinking = true
   }
 
   const protocol = normalizeHttpProtocol(formData.http_protocol)

@@ -232,6 +232,7 @@ import {
   type ModelMappingDraftRequest,
 } from '../model-mapping-editor'
 import { ModelRedirectPanel } from '../model-redirect-panel'
+import { ResponsesViaChatSettings } from '../responses-via-chat-settings'
 import { ResponsesWebSocketSetting } from '../responses-websocket-setting'
 import { UpstreamModelSelection } from '../upstream-model-selection'
 import {
@@ -301,6 +302,10 @@ const SENSITIVE_FORM_FIELDS = [
   'http2_connection_shards',
   'tls_insecure_skip_verify',
   'pass_through_body_enabled',
+  'responses_via_chat',
+  'responses_chat_compatibility',
+  'responses_local_replay',
+  'preserve_history_thinking',
   'responses_websocket_enabled',
   'system_prompt',
   'system_prompt_override',
@@ -4679,6 +4684,10 @@ export function ChannelMutateDrawer({
                 className='space-y-4 disabled:opacity-60'
               >
                 <ResponsesWebSocketSetting
+                  channelType={currentType}
+                  disabled={sensitiveLocked || isSubmitting}
+                />
+                <ResponsesViaChatSettings
                   channelType={currentType}
                   disabled={sensitiveLocked || isSubmitting}
                 />
