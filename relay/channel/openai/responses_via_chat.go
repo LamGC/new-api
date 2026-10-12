@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
@@ -35,6 +36,10 @@ func OaiChatToResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		return nil, types.WithOpenAIError(*oaiError, resp.StatusCode)
 	}
 
+	if info.ChannelSetting.ResponsesViaChat && (len(chatResp.Choices) != 1 || chatResp.Choices[0].Index != 0) {
+		return nil, types.NewOpenAIError(fmt.Errorf("Responses chat bridge requires exactly one primary choice"), types.ErrorCodeBadResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
+	}
+	applyUsagePostProcessing(info, &chatResp.Usage, body)
 	info.ObserveResponseModel(chatResp.Model)
 	if responseID := helper.GetResponseID(c); responseID != "" {
 		chatResp.Id = responseID
@@ -52,6 +57,20 @@ func OaiChatToResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		text := service.ExtractOutputTextFromResponses(responsesResp)
 		usage = service.ResponseText2Usage(c, text, info.UpstreamModelName, info.GetEstimatePromptTokens())
 		responsesResp.Usage = relayconvert.UsageFromChatUsage(usage)
+	}
+
+	if err := service.PersistResponsesReplay(c, info, responsesResp); err != nil {
+		// The provider already produced this response. Return an explicit local
+		// failure, but retain its usage so the caller settles rather than refunds.
+		responsesResp.Status = []byte(`"failed"`)
+		responsesResp.Error = map[string]any{"code": "local_replay_storage_error", "message": "local response history could not be stored", "type": "server_error"}
+		responsesResp.Store = false
+		resp.StatusCode = http.StatusInternalServerError
+		if info.StreamStatus == nil {
+			info.StreamStatus = relaycommon.NewStreamStatus()
+		}
+		info.StreamStatus.MarkFailed("local_replay_storage_error", "server_error", http.StatusInternalServerError)
+		common.SetContextKey(c, constant.ContextKeyResponseStreamStatus, info.StreamStatus)
 	}
 
 	responseBody, err := common.Marshal(responsesResp)
@@ -83,7 +102,24 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 	// told about with response.failed.
 	var upstreamFailure *types.NewAPIError
 
+	sawFinishReason := false
 	sendEvent := func(event relayconvert.ChatToResponsesStreamEvent) bool {
+		if c.Request.Context().Err() != nil {
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, c.Request.Context().Err())
+			info.StreamStatus.MarkCancelled()
+			return false
+		}
+		if event.Payload.Response != nil && (event.Type == "response.completed" || event.Type == "response.incomplete") {
+			if err := service.PersistResponsesReplay(c, info, event.Payload.Response); err != nil {
+				// Output was produced and must still settle, but never advertise a
+				// reusable ID when its snapshot could not be saved.
+				event.Type = "response.failed"
+				event.Payload.Type = event.Type
+				event.Payload.Response.Status = []byte(`"failed"`)
+				event.Payload.Response.Error = map[string]any{"code": "local_replay_storage_error", "message": "local response history could not be stored"}
+				info.StreamStatus.MarkFailed("local_replay_storage_error", "server_error", http.StatusInternalServerError)
+			}
+		}
 		data, err := common.Marshal(event.Payload)
 		if err != nil {
 			streamErr = types.NewOpenAIError(err, types.ErrorCodeJsonMarshalFailed, http.StatusInternalServerError)
@@ -100,6 +136,7 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 			streamErr = types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
 			return false
 		}
+		service.ObserveResponsesOutcome(info, &event.Payload)
 		return true
 	}
 	failResponsesStream := func(err error) bool {
@@ -155,6 +192,23 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 			return
 		}
 
+		if info.ChannelSetting.ResponsesViaChat {
+			for _, choice := range chunk.Choices {
+				if choice.Index != 0 {
+					failure := fmt.Errorf("Responses chat bridge received a non-primary choice")
+					upstreamFailure = types.NewOpenAIError(failure, types.ErrorCodeBadResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
+					failResponsesStream(failure)
+					sr.Stop(upstreamFailure)
+					return
+				}
+			}
+		}
+		for _, choice := range chunk.Choices {
+			if choice.FinishReason != nil && *choice.FinishReason != "" {
+				sawFinishReason = true
+			}
+		}
+		applyUsagePostProcessing(info, chunk.Usage, []byte(data))
 		info.ObserveResponseModel(chunk.Model)
 		results, err := service.ConvertStreamResponseChunk(c, info, state, &chunk)
 		if err != nil {
@@ -196,8 +250,14 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		usage = service.ResponseText2Usage(c, state.UsageText(), info.UpstreamModelName, info.GetEstimatePromptTokens())
 		state.SetUsage(usage)
 	}
-	if info.StreamStatus.EndReason == relaycommon.StreamEndReasonClientGone {
+	if info.StreamStatus.EndReason == relaycommon.StreamEndReasonClientGone || c.Request.Context().Err() != nil {
+		info.StreamStatus.MarkCancelled()
 		return usage, nil
+	}
+	if upstreamFailure == nil && (!sawFinishReason || !info.StreamStatus.IsNormalEnd()) {
+		info.StreamStatus.MarkFailed("upstream_stream_truncated", "server_error", http.StatusBadGateway)
+		failResponsesStream(fmt.Errorf("upstream chat stream ended before a valid completion"))
+		return usage, streamErr
 	}
 
 	finalResults, err := service.FinalizeStreamResponse(c, info, state)

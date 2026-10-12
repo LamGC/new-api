@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
@@ -332,4 +334,108 @@ func requireOrderedSubstrings(t *testing.T, s string, parts ...string) {
 		require.NotEqualf(t, -1, idx, "missing %q after byte offset %d", part, offset)
 		offset += idx + len(part)
 	}
+}
+
+func TestOaiChatToResponsesStreamDoesNotCompleteTruncatedOrCancelled(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+	for _, cancelled := range []bool{false, true} {
+		name := "truncated"
+		if cancelled {
+			name = "cancelled"
+		}
+		t.Run(name, func(t *testing.T) {
+			body := "data: {\"id\":\"chat_test\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n"
+			c, recorder, resp, info := newResponsesChatTestContext(t, body, true)
+			if cancelled {
+				ctx, cancel := context.WithCancel(c.Request.Context())
+				cancel()
+				c.Request = c.Request.WithContext(ctx)
+			}
+			_, apiErr := OaiChatToResponsesStreamHandler(c, info, resp)
+			require.Nil(t, apiErr)
+			assert.NotContains(t, recorder.Body.String(), "response.completed")
+			if cancelled {
+				assert.Equal(t, "cancelled", info.StreamStatus.ResponseOutcome())
+			} else {
+				assert.Contains(t, recorder.Body.String(), "response.failed")
+			}
+		})
+	}
+}
+
+func TestOaiChatToResponsesReplayWriteFailureNeverCompletes(t *testing.T) {
+	originalDB := model.DB
+	model.DB = nil
+	t.Cleanup(func() { model.DB = originalDB })
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+	body := strings.Join([]string{
+		`data: {"id":"chat_1","model":"gpt-test","choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}`,
+		`data: [DONE]`, ``,
+	}, "\n")
+	c, recorder, resp, info := newResponsesChatTestContext(t, body, true)
+	info.UserId = 11
+	info.TokenId = 22
+	_, err := service.PrepareResponsesReplay(c, info, &dto.OpenAIResponsesRequest{Input: []byte(`"hello"`)}, true)
+	require.NoError(t, err)
+	// This fixture has no database: persistence must fail visibly after output
+	// without changing normal usage settlement or emitting a success terminal.
+	usage, apiErr := OaiChatToResponsesStreamHandler(c, info, resp)
+	require.Nil(t, apiErr)
+	require.NotNil(t, usage)
+	assert.Equal(t, 3, usage.TotalTokens)
+	assert.Contains(t, recorder.Body.String(), "response.failed")
+	assert.NotContains(t, recorder.Body.String(), "response.completed")
+	assert.Equal(t, "failed", info.StreamStatus.ResponseOutcome())
+}
+
+func TestOaiChatToResponsesReplayWriteFailureRetainsNonstreamUsage(t *testing.T) {
+	originalDB := model.DB
+	model.DB = nil
+	t.Cleanup(func() { model.DB = originalDB })
+	body := `{"id":"chat_1","model":"gpt-test","choices":[{"index":0,"message":{"role":"assistant","content":"answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}`
+	c, recorder, resp, info := newResponsesChatTestContext(t, body, false)
+	resp.Header.Set("Content-Type", "application/json")
+	info.UserId = 11
+	info.TokenId = 22
+	_, err := service.PrepareResponsesReplay(c, info, &dto.OpenAIResponsesRequest{Input: []byte(`"hello"`)}, true)
+	require.NoError(t, err)
+	usage, apiErr := OaiChatToResponsesHandler(c, info, resp)
+	require.Nil(t, apiErr)
+	require.NotNil(t, usage)
+	assert.Equal(t, 3, usage.TotalTokens)
+	assert.Equal(t, http.StatusInternalServerError, recorder.Code)
+	assert.Contains(t, recorder.Body.String(), `"status":"failed"`)
+	var response dto.OpenAIResponsesResponse
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+	assert.JSONEq(t, `"failed"`, string(response.Status))
+	assert.Equal(t, "failed", info.StreamStatus.ResponseOutcome())
+}
+
+func TestOaiChatToResponsesBridgeRejectsNonPrimaryChoice(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+	body := strings.Join([]string{
+		`data: {"id":"chat_1","model":"gpt-test","choices":[{"index":0,"delta":{"content":"primary"}}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}`,
+		`data: {"id":"chat_1","model":"gpt-test","choices":[{"index":1,"delta":{"content":"other"},"finish_reason":"stop"}]}`,
+		`data: [DONE]`, ``,
+	}, "\n")
+	c, recorder, resp, info := newResponsesChatTestContext(t, body, true)
+	info.ChannelSetting.ResponsesViaChat = true
+	usage, apiErr := OaiChatToResponsesStreamHandler(c, info, resp)
+	require.Nil(t, apiErr)
+	require.NotNil(t, usage)
+	assert.Equal(t, 3, usage.TotalTokens)
+	assert.Contains(t, recorder.Body.String(), "non-primary choice")
+	assert.NotContains(t, recorder.Body.String(), "response.completed")
+	assert.Equal(t, "failed", info.StreamStatus.ResponseOutcome())
+	c, _, resp, info = newResponsesChatTestContext(t, `{"choices":[{"index":0,"message":{"content":"one"}},{"index":1,"message":{"content":"two"}}]}`, false)
+	info.ChannelSetting.ResponsesViaChat = true
+	_, apiErr = OaiChatToResponsesHandler(c, info, resp)
+	require.NotNil(t, apiErr)
+	assert.Equal(t, http.StatusBadGateway, apiErr.StatusCode)
 }

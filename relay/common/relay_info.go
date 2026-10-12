@@ -981,6 +981,10 @@ func (info *RelayInfo) ConvOptions() *convmeta.Options {
 	if info != nil {
 		if info.ChannelMeta != nil {
 			options.ToolLossPolicy = types.ConversionLossPolicy(info.ChannelOtherSettings.ToolLossPolicy)
+			options.PreserveHistoryThinking = info.ChannelSetting.PreserveHistoryThinking
+			if info.ChannelSetting.ResponsesViaChat {
+				options.ResponsesChatCompatibility = info.ChannelSetting.ResponsesChatCompatibility
+			}
 		}
 		info.convOptions = options
 	}

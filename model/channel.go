@@ -999,6 +999,9 @@ func (channel *Channel) ValidateSettings() error {
 	if _, err := common.ParseProxyURLStrict(channelParams.Proxy); err != nil {
 		return fmt.Errorf("invalid channel proxy: %w", err)
 	}
+	if err := channelParams.ValidateResponsesViaChat(common.SupportsResponsesViaChat(channel.Type)); err != nil {
+		return err
+	}
 	if err := channelParams.ValidateHTTPTransport(); err != nil {
 		return err
 	}

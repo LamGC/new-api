@@ -23,6 +23,12 @@ import (
 // The returned adaptor retains route/conversion state for DoRequest/DoResponse.
 func PrepareResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, req *dto.OpenAIResponsesRequest) (relaychannel.Adaptor, common.ReplayableBody, io.Closer, *types.NewAPIError) {
 	info.InitChannelMeta(c)
+	if err := info.ChannelSetting.ValidateResponsesViaChat(common.SupportsResponsesViaChat(info.ChannelType)); err != nil {
+		return nil, nil, nil, types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+	}
+	if info.ChannelSetting.ResponsesViaChat && (info.RelayMode != relayconstant.RelayModeResponses || model_setting.GetGlobalSettings().PassThroughRequestEnabled) {
+		return nil, nil, nil, types.NewErrorWithStatusCode(fmt.Errorf("responses_via_chat requires the Responses endpoint without pass-through"), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+	}
 	if info.RelayMode == relayconstant.RelayModeResponsesCompact &&
 		!common.SupportsResponsesCompact(info.ChannelType, info.ApiType) {
 		return nil, nil, nil, types.NewErrorWithStatusCode(
@@ -48,6 +54,9 @@ func PrepareResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, req *d
 	if adaptor == nil {
 		return nil, nil, nil, types.NewError(fmt.Errorf("invalid api type: %d", info.ApiType), types.ErrorCodeInvalidApiType, types.ErrOptionWithSkipRetry())
 	}
+	if info.ChannelSetting.ResponsesViaChat {
+		adaptor = &responsesViaChatAdaptor{Adaptor: adaptor}
+	}
 	adaptor.Init(info)
 	if model_setting.GetGlobalSettings().PassThroughRequestEnabled || info.ChannelSetting.PassThroughBodyEnabled {
 		storage, err := common.GetBodyStorage(c)
@@ -71,10 +80,17 @@ func PrepareResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, req *d
 	if err != nil {
 		return nil, nil, nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
 	}
+	beforeOverrides := jsonData
 	if len(info.ParamOverride) > 0 {
 		jsonData, err = relaycommon.ApplyParamOverrideWithRelayInfo(jsonData, info)
 		if err != nil {
 			return nil, nil, nil, newAPIErrorFromParamOverride(err)
+		}
+	}
+
+	if info.ChannelSetting.ResponsesViaChat {
+		if err := validateResponsesViaChatOverrides(beforeOverrides, jsonData, info.ChannelSetting.ResponsesLocalReplay); err != nil {
+			return nil, nil, nil, types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 		}
 	}
 

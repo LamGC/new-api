@@ -105,3 +105,14 @@ func SupportsResponsesCompact(channelType, apiType int) bool {
 		return false
 	}
 }
+
+// SupportsResponsesViaChat is deliberately narrower than APITypeOpenAI: unknown
+// channel types must not inherit a wire-protocol capability through fallback.
+func SupportsResponsesViaChat(channelType int) bool {
+	switch channelType {
+	case constant.ChannelTypeOpenAI, constant.ChannelTypeAzure, constant.ChannelTypeDeepSeek:
+		return true
+	default:
+		return false
+	}
+}

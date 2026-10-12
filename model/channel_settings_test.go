@@ -195,3 +195,34 @@ func TestInferencePresetSettingsAndDatabaseRoundTrip(t *testing.T) {
 		})
 	}
 }
+
+func TestChannelValidateResponsesViaChatSettings(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		channelType int
+		settings    dto.ChannelSettings
+		valid       bool
+	}{
+		{"default unchanged", constant.ChannelTypeGemini, dto.ChannelSettings{}, true},
+		{"OpenAI", constant.ChannelTypeOpenAI, dto.ChannelSettings{ResponsesViaChat: true}, true},
+		{"Azure", constant.ChannelTypeAzure, dto.ChannelSettings{ResponsesViaChat: true}, true},
+		{"DeepSeek profile and replay", constant.ChannelTypeDeepSeek, dto.ChannelSettings{ResponsesViaChat: true, ResponsesChatCompatibility: "legacy", ResponsesLocalReplay: true}, true},
+		{"native wire denied", constant.ChannelTypeGemini, dto.ChannelSettings{ResponsesViaChat: true}, false},
+		{"unknown denied", 999, dto.ChannelSettings{ResponsesViaChat: true}, false},
+		{"profile without bridge", constant.ChannelTypeOpenAI, dto.ChannelSettings{ResponsesChatCompatibility: "legacy"}, false},
+		{"replay without bridge", constant.ChannelTypeOpenAI, dto.ChannelSettings{ResponsesLocalReplay: true}, false},
+		{"websocket denied", constant.ChannelTypeOpenAI, dto.ChannelSettings{ResponsesViaChat: true, ResponsesWebSocketEnabled: true}, false},
+		{"passthrough denied", constant.ChannelTypeOpenAI, dto.ChannelSettings{ResponsesViaChat: true, PassThroughBodyEnabled: true}, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			channel := &Channel{Type: test.channelType}
+			channel.SetSetting(test.settings)
+			err := channel.ValidateSettings()
+			if test.valid {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+			}
+		})
+	}
+}
