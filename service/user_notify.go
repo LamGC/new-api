@@ -2,15 +2,14 @@ package service
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 )
 
@@ -18,34 +17,37 @@ func NotifyRootUser(t string, subject string, content string) {
 	user := model.GetRootUser().ToBaseUser()
 	err := NotifyUser(user.Id, user.Email, user.GetSetting(), dto.NewNotify(t, subject, content, nil))
 	if err != nil {
-		common.SysLog(fmt.Sprintf("failed to notify root user: %s", err.Error()))
+		common.SysLog(common.LogText("failed to notify root user: %s", err.Error()))
 	}
 }
 
-func NotifyUpstreamModelUpdateWatchers(subject string, content string) {
+// NotifyUpstreamModelUpdateWatchers sends the upstream model update notice to
+// every administrator who enabled it. render builds the subject and content in
+// the recipient's saved language; an empty language means DEFAULT_LANGUAGE.
+func NotifyUpstreamModelUpdateWatchers(render func(lang string) (subject string, content string)) {
 	var users []model.User
 	if err := model.DB.
 		Select("id", "email", "role", "status", "setting").
 		Where("status = ? AND role >= ?", common.UserStatusEnabled, common.RoleAdminUser).
 		Find(&users).Error; err != nil {
-		common.SysLog(fmt.Sprintf("failed to query upstream update notification users: %s", err.Error()))
+		common.SysLog(common.LogText("failed to query upstream update notification users: %s", err.Error()))
 		return
 	}
 
-	notification := dto.NewNotify(dto.NotifyTypeChannelUpdate, subject, content, nil)
 	sentCount := 0
 	for _, user := range users {
 		userSetting := user.GetSetting()
 		if !userSetting.UpstreamModelUpdateNotifyEnabled {
 			continue
 		}
-		if err := NotifyUser(user.Id, user.Email, userSetting, notification); err != nil {
-			common.SysLog(fmt.Sprintf("failed to notify user %d for upstream model update: %s", user.Id, err.Error()))
+		subject, content := render(userSetting.Language)
+		if err := NotifyUser(user.Id, user.Email, userSetting, dto.NewNotify(dto.NotifyTypeChannelUpdate, subject, content, nil)); err != nil {
+			common.SysLog(common.LogText("failed to notify user %d for upstream model update: %s", user.Id, err.Error()))
 			continue
 		}
 		sentCount++
 	}
-	common.SysLog(fmt.Sprintf("upstream model update notifications sent: %d", sentCount))
+	common.SysLog(common.LogText("upstream model update notifications sent: %d", sentCount))
 }
 
 func NotifyUser(userId int, userEmail string, userSetting dto.UserSetting, data dto.Notify) error {
@@ -57,7 +59,7 @@ func NotifyUser(userId int, userEmail string, userSetting dto.UserSetting, data 
 	// Check notification limit
 	canSend, err := CheckNotificationLimit(userId, data.Type)
 	if err != nil {
-		common.SysLog(fmt.Sprintf("failed to check notification limit: %s", err.Error()))
+		common.SysLog(common.LogText("failed to check notification limit: %s", err.Error()))
 		return err
 	}
 	if !canSend {
@@ -72,14 +74,14 @@ func NotifyUser(userId int, userEmail string, userSetting dto.UserSetting, data 
 			emailToUse = userEmail
 		}
 		if emailToUse == "" {
-			common.SysLog(fmt.Sprintf("user %d has no email, skip sending email", userId))
+			common.SysLog(common.LogText("user %d has no email, skip sending email", userId))
 			return nil
 		}
 		return sendEmailNotify(emailToUse, data)
 	case dto.NotifyTypeWebhook:
 		webhookURLStr := userSetting.WebhookUrl
 		if webhookURLStr == "" {
-			common.SysLog(fmt.Sprintf("user %d has no webhook url, skip sending webhook", userId))
+			common.SysLog(common.LogText("user %d has no webhook url, skip sending webhook", userId))
 			return nil
 		}
 
@@ -89,7 +91,7 @@ func NotifyUser(userId int, userEmail string, userSetting dto.UserSetting, data 
 	case dto.NotifyTypeBark:
 		barkURL := userSetting.BarkUrl
 		if barkURL == "" {
-			common.SysLog(fmt.Sprintf("user %d has no bark url, skip sending bark", userId))
+			common.SysLog(common.LogText("user %d has no bark url, skip sending bark", userId))
 			return nil
 		}
 		return sendBarkNotify(barkURL, data)
@@ -97,7 +99,7 @@ func NotifyUser(userId int, userEmail string, userSetting dto.UserSetting, data 
 		gotifyUrl := userSetting.GotifyUrl
 		gotifyToken := userSetting.GotifyToken
 		if gotifyUrl == "" || gotifyToken == "" {
-			common.SysLog(fmt.Sprintf("user %d has no gotify url or token, skip sending gotify", userId))
+			common.SysLog(common.LogText("user %d has no gotify url or token, skip sending gotify", userId))
 			return nil
 		}
 		return sendGotifyNotify(gotifyUrl, gotifyToken, userSetting.GotifyPriority, data)
@@ -154,8 +156,7 @@ func sendBarkNotify(barkURL string, data dto.Notify) error {
 		}
 	} else {
 		// SSRF防护：验证Bark URL（非Worker模式）
-		fetchSetting := system_setting.GetFetchSetting()
-		if err := common.ValidateURLWithFetchSetting(finalURL, fetchSetting.EnableSSRFProtection, fetchSetting.AllowPrivateIp, fetchSetting.DomainFilterMode, fetchSetting.IpFilterMode, fetchSetting.DomainList, fetchSetting.IpList, fetchSetting.AllowedPorts, fetchSetting.ApplyIPFilterForDomain); err != nil {
+		if err := ValidateSSRFProtectedFetchURL(finalURL); err != nil {
 			return fmt.Errorf("request reject: %v", err)
 		}
 
@@ -169,7 +170,7 @@ func sendBarkNotify(barkURL string, data dto.Notify) error {
 		req.Header.Set("User-Agent", "OneAPI-Bark-Notify/1.0")
 
 		// 发送请求
-		client := GetHttpClient()
+		client := GetSSRFProtectedHTTPClient()
 		resp, err = client.Do(req)
 		if err != nil {
 			return fmt.Errorf("failed to send bark request: %v", err)
@@ -215,7 +216,7 @@ func sendGotifyNotify(gotifyUrl string, gotifyToken string, priority int, data d
 	}
 
 	// 序列化为 JSON
-	payloadBytes, err := json.Marshal(payload)
+	payloadBytes, err := common.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("failed to marshal gotify payload: %v", err)
 	}
@@ -248,8 +249,7 @@ func sendGotifyNotify(gotifyUrl string, gotifyToken string, priority int, data d
 		}
 	} else {
 		// SSRF防护：验证Gotify URL（非Worker模式）
-		fetchSetting := system_setting.GetFetchSetting()
-		if err := common.ValidateURLWithFetchSetting(finalURL, fetchSetting.EnableSSRFProtection, fetchSetting.AllowPrivateIp, fetchSetting.DomainFilterMode, fetchSetting.IpFilterMode, fetchSetting.DomainList, fetchSetting.IpList, fetchSetting.AllowedPorts, fetchSetting.ApplyIPFilterForDomain); err != nil {
+		if err := ValidateSSRFProtectedFetchURL(finalURL); err != nil {
 			return fmt.Errorf("request reject: %v", err)
 		}
 
@@ -264,7 +264,7 @@ func sendGotifyNotify(gotifyUrl string, gotifyToken string, priority int, data d
 		req.Header.Set("User-Agent", "NewAPI-Gotify-Notify/1.0")
 
 		// 发送请求
-		client := GetHttpClient()
+		client := GetSSRFProtectedHTTPClient()
 		resp, err = client.Do(req)
 		if err != nil {
 			return fmt.Errorf("failed to send gotify request: %v", err)

@@ -1,0 +1,67 @@
+name: Responses compatibility
+
+on:
+  pull_request:
+    branches: [main-fork]
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [integrate/responses-via-chat-20261012]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: responses-compat-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  replay-databases:
+    name: Replay on SQLite, MySQL and PostgreSQL
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: replay-test-only
+          MYSQL_DATABASE: replay_test
+        ports: ['3306:3306']
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -preplay-test-only"
+          --health-interval=10s --health-timeout=5s --health-retries=12
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: replay_test
+          POSTGRES_PASSWORD: replay-test-only
+          POSTGRES_DB: replay_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd="pg_isready -U replay_test -d replay_test"
+          --health-interval=10s --health-timeout=5s --health-retries=12
+    env:
+      GOWORK: 'off'
+      AUDIT_MYSQL_DSN: root:replay-test-only@tcp(127.0.0.1:3306)/replay_test?charset=utf8mb4&parseTime=True&loc=Local
+      AUDIT_POSTGRES_DSN: postgres://replay_test:replay-test-only@127.0.0.1:5432/replay_test?sslmode=disable
+      REPLAY_TEST_MYSQL_DSN: root:replay-test-only@tcp(127.0.0.1:3306)/replay_test?charset=utf8mb4&parseTime=True&loc=Local
+      REPLAY_TEST_POSTGRES_DSN: host=127.0.0.1 port=5432 user=replay_test password=replay-test-only dbname=replay_test sslmode=disable
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            relaykit/go.sum
+            tokenkit/go.sum
+      - name: Replay persistence and migration contracts
+        run: go test -v ./service -run '^TestResponsesReplay$' -count=1
+      - name: Release log export database contracts
+        run: go test -v ./controller -run 'TestLogExportDatabaseMatrix|TestLogExportRules|TestAcquireLogExportLock' -count=1
+      - name: Bridge and billing contracts
+        run: go test ./relay ./relay/channel/openai ./model -run 'ResponsesViaChat|ResponsesLocalReplayParameter|ResponsesReplayBilling|OaiChatToResponses|ChannelValidateResponses' -count=1
+      - name: Independent converter build and tests
+        working-directory: relaykit
+        run: |
+          go build ./...
+          go test ./...

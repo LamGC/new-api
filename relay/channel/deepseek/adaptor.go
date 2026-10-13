@@ -8,16 +8,15 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/dto"
-	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relay/channel/claude"
 	"github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
-	relayconstant "github.com/QuantumNous/new-api/relay/constant"
-	"github.com/QuantumNous/new-api/service/openaicompat"
+	"github.com/QuantumNous/new-api/relay/constant"
+	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/QuantumNous/new-api/setting/reasoning"
-	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 )
 
@@ -68,8 +67,10 @@ func (a *Adaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
 			fimBaseUrl += "/beta"
 		}
 		switch info.RelayMode {
-		case relayconstant.RelayModeCompletions:
+		case constant.RelayModeCompletions:
 			return fmt.Sprintf("%s/completions", fimBaseUrl), nil
+		case constant.RelayModeResponses:
+			return fmt.Sprintf("%s/responses", info.ChannelBaseUrl), nil
 		default:
 			return fmt.Sprintf("%s/v1/chat/completions", info.ChannelBaseUrl), nil
 		}
@@ -98,6 +99,9 @@ func applyDeepSeekV4OpenAIThinkingSuffix(info *relaycommon.RelayInfo, request *d
 	if info != nil && info.ChannelMeta != nil && info.UpstreamModelName != "" {
 		modelName = info.UpstreamModelName
 	}
+	if model_setting.ShouldPreserveThinkingSuffix(modelName) || info != nil && model_setting.ShouldPreserveThinkingSuffix(info.OriginModelName) {
+		return nil
+	}
 	baseModel, thinkingType, effort, ok := reasoning.ParseDeepSeekV4ThinkingSuffix(modelName)
 	if !ok {
 		return nil
@@ -115,7 +119,7 @@ func applyDeepSeekV4OpenAIThinkingSuffix(info *relaycommon.RelayInfo, request *d
 		if info.ChannelMeta != nil {
 			info.UpstreamModelName = baseModel
 		}
-		info.ReasoningEffort = effort
+		info.SetReasoningEffort(effort)
 	}
 	return nil
 }
@@ -124,6 +128,9 @@ func applyDeepSeekV4ClaudeThinkingSuffix(info *relaycommon.RelayInfo, request *d
 	modelName := request.Model
 	if info != nil && info.ChannelMeta != nil && info.UpstreamModelName != "" {
 		modelName = info.UpstreamModelName
+	}
+	if model_setting.ShouldPreserveThinkingSuffix(modelName) || info != nil && model_setting.ShouldPreserveThinkingSuffix(info.OriginModelName) {
+		return nil
 	}
 	baseModel, thinkingType, effort, ok := reasoning.ParseDeepSeekV4ThinkingSuffix(modelName)
 	if !ok {
@@ -146,7 +153,7 @@ func applyDeepSeekV4ClaudeThinkingSuffix(info *relaycommon.RelayInfo, request *d
 		if info.ChannelMeta != nil {
 			info.UpstreamModelName = baseModel
 		}
-		info.ReasoningEffort = effort
+		info.SetReasoningEffort(effort)
 	}
 	return nil
 }
@@ -160,72 +167,36 @@ func (a *Adaptor) ConvertEmbeddingRequest(c *gin.Context, info *relaycommon.Rela
 	return nil, errors.New("not implemented")
 }
 
-func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.OpenAIResponsesRequest) (any, error) {
-	// Parse reasoning effort from model suffix
-	effort, originModel := reasoning.ParseOpenAIReasoningEffortFromModelSuffix(request.Model)
-	if effort != "" {
+func (a *Adaptor) ConvertOpenAIResponsesRequest(_ *gin.Context, info *relaycommon.RelayInfo, request dto.OpenAIResponsesRequest) (any, error) {
+	applyDeepSeekV4ResponsesThinkingSuffix(info, &request)
+	return request, nil
+}
+
+func applyDeepSeekV4ResponsesThinkingSuffix(info *relaycommon.RelayInfo, request *dto.OpenAIResponsesRequest) {
+	modelName := request.Model
+	if info != nil && info.ChannelMeta != nil && info.UpstreamModelName != "" {
+		modelName = info.UpstreamModelName
+	}
+	if model_setting.ShouldPreserveThinkingSuffix(modelName) || info != nil && model_setting.ShouldPreserveThinkingSuffix(info.OriginModelName) {
+		return
+	}
+	baseModel, thinkingType, effort, ok := reasoning.ParseDeepSeekV4ThinkingSuffix(modelName)
+	if ok {
+		if thinkingType == "disabled" {
+			effort = "none"
+		}
+		request.Model = baseModel
 		if request.Reasoning == nil {
-			request.Reasoning = &dto.Reasoning{Effort: effort}
-		} else {
-			request.Reasoning.Effort = effort
+			request.Reasoning = &dto.Reasoning{}
 		}
-		request.Model = originModel
-	}
-	if info != nil && request.Reasoning != nil && request.Reasoning.Effort != "" {
-		info.ReasoningEffort = request.Reasoning.Effort
-	}
-
-	// Load previous conversation if previous_response_id is set
-	var historyMessages []dto.Message
-	if request.PreviousResponseID != "" && info != nil {
-		prevConv, exists, _ := model.GetConversationByResponseID(info.UserId, request.PreviousResponseID)
-		if exists {
-			historyMessages, _ = prevConv.GetMessages()
+		request.Reasoning.Effort = effort
+		if info != nil && info.ChannelMeta != nil {
+			info.UpstreamModelName = baseModel
 		}
 	}
-
-	// Convert new input to Chat messages
-	result, err := openaicompat.ResponsesRequestToChatRequestWithMapping(&request)
-	if err != nil {
-		return nil, fmt.Errorf("convert responses to chat: %w", err)
+	if info != nil && request.Reasoning != nil {
+		info.SetReasoningEffort(request.Reasoning.Effort)
 	}
-	chatReq := result.ChatRequest
-
-	// Merge history on top (history first, then new messages)
-	fullMessages := append(historyMessages, chatReq.Messages...)
-	chatReq.Messages = fullMessages
-
-	// Apply DeepSeek V4 thinking suffix handling
-	if err := applyDeepSeekV4OpenAIThinkingSuffix(info, chatReq); err != nil {
-		return nil, err
-	}
-
-	// Record the conversion in the chain
-	if info != nil {
-		info.AppendRequestConversion(types.RelayFormatOpenAI)
-		info.FinalRequestRelayFormat = types.RelayFormatOpenAI
-
-		// Build tool mapping for response conversion
-		toolMapping := make(map[string]relaycommon.ResponseToolMapping)
-		for name, entry := range result.ToolMapping {
-			toolMapping[name] = relaycommon.ResponseToolMapping{
-				UpstreamName: entry.UpstreamName,
-				SourceType:   entry.SourceType,
-				OriginalName: entry.OriginalName,
-				Namespace:    entry.Namespace,
-			}
-		}
-
-		// Store full messages + tool mapping for post-response conversation storage
-		info.ResponsesConversationInfo = &relaycommon.ResponsesConversationInfo{
-			FullMessages:       fullMessages,
-			PreviousResponseID: request.PreviousResponseID,
-			NewResponseID:      "resp_" + common.GetTimeString() + common.GetRandomString(8),
-			ToolMapping:        toolMapping,
-		}
-	}
-
-	return chatReq, nil
 }
 
 func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (any, error) {
@@ -233,25 +204,6 @@ func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, request
 }
 
 func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (usage any, err *types.NewAPIError) {
-	// For Responses mode, convert Chat response back to Responses format
-	if info.RelayMode == relayconstant.RelayModeResponses {
-		var u *dto.Usage
-		var e *types.NewAPIError
-
-		if info.IsStream {
-			u, e = DeepSeekResponsesStreamHandler(c, info, resp)
-		} else {
-			u, e = DeepSeekResponsesHandler(c, info, resp)
-		}
-
-		// Save conversation after response
-		if e == nil && info.ResponsesConversationInfo != nil {
-			saveConversationFromResponse(info, u)
-		}
-
-		return u, e
-	}
-
 	switch info.RelayFormat {
 	case types.RelayFormatClaude:
 		adaptor := claude.Adaptor{}
@@ -259,30 +211,6 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 	default:
 		adaptor := openai.Adaptor{}
 		return adaptor.DoResponse(c, resp, info)
-	}
-}
-
-func saveConversationFromResponse(info *relaycommon.RelayInfo, usage *dto.Usage) {
-	convInfo := info.ResponsesConversationInfo
-	if convInfo == nil {
-		return
-	}
-
-	allMessages := append(convInfo.FullMessages, convInfo.AssistantMessages...)
-
-	conv := &model.ConversationResponse{
-		ResponseID:         convInfo.NewResponseID,
-		UserID:             info.UserId,
-		PreviousResponseID: convInfo.PreviousResponseID,
-		Model:              info.OriginModelName,
-	}
-	if err := conv.SetMessages(allMessages); err != nil {
-		common.SysLog("failed to set conversation messages: " + err.Error())
-		return
-	}
-
-	if err := conv.Insert(); err != nil {
-		common.SysLog("failed to save conversation: " + err.Error())
 	}
 }
 

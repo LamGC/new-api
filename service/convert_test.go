@@ -3,131 +3,112 @@ package service
 import (
 	"testing"
 
-	"github.com/QuantumNous/new-api/dto"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-func newRelayInfo() *relaycommon.RelayInfo {
-	return &relaycommon.RelayInfo{
-		ChannelMeta: &relaycommon.ChannelMeta{},
+func TestResponseConverterFacades(t *testing.T) {
+	cache5m, cache1h := NormalizeCacheCreationSplit(10, 3, 2)
+	assert.Equal(t, 8, cache5m)
+	assert.Equal(t, 2, cache1h)
+
+	chatResp := &dto.OpenAITextResponse{
+		Id:    "chatcmpl_1",
+		Model: "gpt-test",
+		Choices: []dto.OpenAITextResponseChoice{
+			{
+				Message: dto.Message{
+					Role:    "assistant",
+					Content: "hello",
+				},
+				FinishReason: "stop",
+			},
+		},
 	}
+
+	claudeResp := ResponseOpenAI2Claude(chatResp, &relaycommon.RelayInfo{})
+	require.NotNil(t, claudeResp)
+	assert.Equal(t, "message", claudeResp.Type)
+
+	geminiResp := ResponseOpenAI2Gemini(chatResp, &relaycommon.RelayInfo{})
+	require.NotNil(t, geminiResp)
+	require.Len(t, geminiResp.Candidates, 1)
 }
 
-func TestClaudeToOpenAIRequest_PreservesThinkingOnAssistantMessages(t *testing.T) {
-	thinkingText := "Let me think about this step by step."
-	claudeReq := dto.ClaudeRequest{
-		Model: "claude-sonnet-4-5-20250929",
-		Messages: []dto.ClaudeMessage{
-			{Role: "user", Content: "Hello"},
+func TestStreamResponseConverterFacades(t *testing.T) {
+	info := &relaycommon.RelayInfo{
+		SendResponseCount: 1,
+		ClaudeConvertInfo: &relaycommon.ClaudeConvertInfo{
+			LastMessagesType: relaycommon.LastMessageTypeNone,
+		},
+	}
+	streamResp := &dto.ChatCompletionsStreamResponse{
+		Id:    "chatcmpl_1",
+		Model: "gpt-test",
+		Choices: []dto.ChatCompletionsStreamResponseChoice{
 			{
-				Role: "assistant",
-				Content: []dto.ClaudeMediaMessage{
-					{Type: "thinking", Thinking: &thinkingText},
-					{Type: "text", Text: strPtr("The answer is 42.")},
+				Delta: dto.ChatCompletionsStreamResponseChoiceDelta{
+					Content: ptrValue("hello"),
 				},
 			},
 		},
 	}
 
-	info := newRelayInfo()
-	result, err := ClaudeToOpenAIRequest(claudeReq, info)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	claudeResponses := StreamResponseOpenAI2Claude(streamResp, info)
+	require.NotEmpty(t, claudeResponses)
 
-	if len(result.Messages) != 2 {
-		t.Fatalf("expected 2 messages, got %d", len(result.Messages))
-	}
+	geminiResp := StreamResponseOpenAI2Gemini(streamResp, &relaycommon.RelayInfo{})
+	require.NotNil(t, geminiResp)
+	require.Len(t, geminiResp.Candidates, 1)
+}
 
-	assistantMsg := result.Messages[1]
-	if assistantMsg.Role != "assistant" {
-		t.Fatalf("expected assistant role, got %s", assistantMsg.Role)
-	}
+func TestRequestConverterFacadeAcceptsTypedNilRelayInfo(t *testing.T) {
+	for _, target := range []types.RelayFormat{types.RelayFormatClaude, types.RelayFormatGemini} {
+		t.Run(string(target), func(t *testing.T) {
+			var info *relaycommon.RelayInfo
+			request := &dto.GeneralOpenAIRequest{
+				Model: "test-model",
+				Messages: []dto.Message{
+					{Role: "user", Content: "hello"},
+				},
+			}
 
-	if assistantMsg.ReasoningContent == nil {
-		t.Fatal("expected reasoning_content to be set from thinking block, got nil")
-	}
+			result, err := ConvertRequest(nil, info, target, request)
 
-	if *assistantMsg.ReasoningContent != thinkingText {
-		t.Fatalf("reasoning_content mismatch: expected %q, got %q", thinkingText, *assistantMsg.ReasoningContent)
-	}
-
-	contents := assistantMsg.ParseContent()
-	if len(contents) == 0 {
-		t.Fatal("expected content from text block")
-	}
-	if contents[0].Text != "The answer is 42." {
-		t.Fatalf("text content mismatch: %q", contents[0].Text)
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			assert.Equal(t, target, result.To)
+		})
 	}
 }
 
-func TestClaudeToOpenAIRequest_PreservesMultipleThinkingBlocks(t *testing.T) {
-	t1 := "First reasoning step."
-	t2 := "Second reasoning step."
-	claudeReq := dto.ClaudeRequest{
-		Model: "claude-sonnet-4-5-20250929",
-		Messages: []dto.ClaudeMessage{
-			{Role: "user", Content: "Hello"},
+func TestStreamResponseConverterFacadesAcceptTypedNilRelayInfo(t *testing.T) {
+	var info *relaycommon.RelayInfo
+	streamResp := &dto.ChatCompletionsStreamResponse{
+		Id:    "chatcmpl_typed_nil",
+		Model: "gpt-test",
+		Choices: []dto.ChatCompletionsStreamResponseChoice{
 			{
-				Role: "assistant",
-				Content: []dto.ClaudeMediaMessage{
-					{Type: "thinking", Thinking: &t1},
-					{Type: "text", Text: strPtr("Part 1.")},
-					{Type: "thinking", Thinking: &t2},
-					{Type: "text", Text: strPtr("Part 2.")},
+				Delta: dto.ChatCompletionsStreamResponseChoiceDelta{
+					Content: ptrValue("hello"),
 				},
 			},
 		},
 	}
 
-	info := newRelayInfo()
-	result, err := ClaudeToOpenAIRequest(claudeReq, info)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	claudeResponses := StreamResponseOpenAI2Claude(streamResp, info)
+	require.NotEmpty(t, claudeResponses)
+	assert.Equal(t, "content_block_start", claudeResponses[0].Type)
 
-	assistantMsg := result.Messages[1]
-	if assistantMsg.ReasoningContent == nil {
-		t.Fatal("expected reasoning_content to be set")
-	}
-
-	expected := t1 + "\n" + t2
-	if *assistantMsg.ReasoningContent != expected {
-		t.Fatalf("reasoning_content mismatch: expected %q, got %q", expected, *assistantMsg.ReasoningContent)
-	}
+	geminiResp := StreamResponseOpenAI2Gemini(streamResp, info)
+	require.NotNil(t, geminiResp)
+	require.Len(t, geminiResp.Candidates, 1)
+	assert.Zero(t, geminiResp.UsageMetadata.PromptTokenCount)
 }
 
-func TestClaudeToOpenAIRequest_MessageWithOnlyThinking(t *testing.T) {
-	thinkingText := "I'm just thinking, no text output."
-	claudeReq := dto.ClaudeRequest{
-		Model: "claude-sonnet-4-5-20250929",
-		Messages: []dto.ClaudeMessage{
-			{Role: "user", Content: "Hello"},
-			{
-				Role: "assistant",
-				Content: []dto.ClaudeMediaMessage{
-					{Type: "thinking", Thinking: &thinkingText},
-				},
-			},
-		},
-	}
-
-	info := newRelayInfo()
-	result, err := ClaudeToOpenAIRequest(claudeReq, info)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// Assistant message with only thinking should still be included
-	assistantMsg := result.Messages[1]
-	if assistantMsg.ReasoningContent == nil {
-		t.Fatal("expected reasoning_content to be set")
-	}
-	if *assistantMsg.ReasoningContent != thinkingText {
-		t.Fatalf("reasoning_content mismatch: expected %q, got %q", thinkingText, *assistantMsg.ReasoningContent)
-	}
-}
-
-func strPtr(s string) *string {
-	return &s
+func ptrValue[T any](value T) *T {
+	return &value
 }
