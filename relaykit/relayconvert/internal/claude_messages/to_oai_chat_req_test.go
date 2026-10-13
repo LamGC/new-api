@@ -164,11 +164,17 @@ func TestClaudeMessagesHistoryThinkingOptIn(t *testing.T) {
 				{Role: "user", Content: "continue"},
 				{Role: "assistant", Content: []dto.ClaudeMediaMessage{
 					{Type: "thinking", Thinking: lo.ToPtr("tool reasoning")},
+					{Type: "text", Text: lo.ToPtr("I will search now.")},
 					{Type: "tool_use", Id: "call_1", Name: "search", Input: map[string]any{"q": "test"}},
 				}},
 			}}
 			got, err := ClaudeMessagesRequestToOpenAIChat(context.Background(), req, meta)
 			require.NoError(t, err)
+			last := got.Messages[len(got.Messages)-1]
+			require.Len(t, last.ParseContent(), 1)
+			assert.Equal(t, "I will search now.", last.ParseContent()[0].Text)
+			require.Len(t, last.ParseToolCalls(), 1)
+			assert.Equal(t, "call_1", last.ParseToolCalls()[0].ID)
 			if enabled {
 				require.Len(t, got.Messages, 4)
 				assert.Equal(t, "first\nsecond", got.Messages[1].GetReasoningContent())

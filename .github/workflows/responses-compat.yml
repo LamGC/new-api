@@ -41,6 +41,8 @@ jobs:
           --health-interval=10s --health-timeout=5s --health-retries=12
     env:
       GOWORK: 'off'
+      AUDIT_MYSQL_DSN: root:replay-test-only@tcp(127.0.0.1:3306)/replay_test?charset=utf8mb4&parseTime=True&loc=Local
+      AUDIT_POSTGRES_DSN: postgres://replay_test:replay-test-only@127.0.0.1:5432/replay_test?sslmode=disable
       REPLAY_TEST_MYSQL_DSN: root:replay-test-only@tcp(127.0.0.1:3306)/replay_test?charset=utf8mb4&parseTime=True&loc=Local
       REPLAY_TEST_POSTGRES_DSN: host=127.0.0.1 port=5432 user=replay_test password=replay-test-only dbname=replay_test sslmode=disable
     steps:
@@ -54,6 +56,8 @@ jobs:
             tokenkit/go.sum
       - name: Replay persistence and migration contracts
         run: go test -v ./service -run '^TestResponsesReplay$' -count=1
+      - name: Release log export database contracts
+        run: go test -v ./controller -run 'TestLogExportDatabaseMatrix|TestLogExportRules|TestAcquireLogExportLock' -count=1
       - name: Bridge and billing contracts
         run: go test ./relay ./relay/channel/openai ./model -run 'ResponsesViaChat|ResponsesLocalReplayParameter|ResponsesReplayBilling|OaiChatToResponses|ChannelValidateResponses' -count=1
       - name: Independent converter build and tests
